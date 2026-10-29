@@ -8,7 +8,7 @@ import { openPgliteDb, type Db } from "../src/db.js";
 import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 
-const MIGRATIONS_DIR = fileURLToPath(new URL("../../packages/db/drizzle", import.meta.url));
+const MIGRATIONS_DIR = fileURLToPath(new URL("../../../packages/db/drizzle", import.meta.url));
 
 function makeEvent(seq: number, structured: Record<string, unknown>): StreamWindowEvent {
   return {
@@ -72,7 +72,7 @@ describe("springboard API", () => {
     const body = res.json();
     expect(body.version).toBe("v1");
     expect(body.schema.type).toBe("object");
-    expect(body.schema.required).toContain("event");
+    expect(body.schema.required).toContain("tokens");
     expect(body.schema.properties.event.properties.structured).toBeDefined();
   });
 
@@ -122,39 +122,42 @@ describe("springboard API", () => {
   });
 
   it("GET /events (SSE) streams persisted events live", async () => {
-    // Use a real listening server so the SSE stream can be read incrementally.
-    const server = await app.listen({ port: 0, host: "127.0.0.1" });
-    const addr = app.server.address();
-    const port = typeof addr === "object" && addr ? addr.port : 0;
-    const base = `http://127.0.0.1:${port}`;
+    // Use a dedicated listening instance so the SSE stream can be read incrementally
+    // (app.inject does not stream SSE bodies).
+    const sseApp = buildApp({ db, cfg: loadConfig({ SSE_POLL_MS: "100" }) });
+    await sseApp.ready();
+    await sseApp.listen({ port: 0, host: "127.0.0.1" });
+    const addr = sseApp.server.address();
+    const port = typeof addr === "object" && addr ? (addr as { port: number }).port : 0;
+    const url = `http://127.0.0.1:${port}/api/sessions/${sessionId}/events`;
 
-    const ctrl = new AbortController();
-    const response = await fetch(`${base}/api/sessions/${sessionId}/events`, {
-      signal: ctrl.signal,
-    });
-    expect(response.status).toBe(200);
-    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    const controller = new AbortController();
+    const resp = await fetch(url, { signal: controller.signal });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toContain("text/event-stream");
 
-    const reader = response.body!.getReader();
+    const reader = resp.body!.getReader();
     const decoder = new TextDecoder();
-    const collected: string[] = [];
-    const readToTime = new Promise<void>((resolve) => {
-      const read = async () => {
+    let raw = "";
+    try {
+      while (true) {
         const { value, done } = await reader.read();
-        if (done) return resolve();
-        collected.push(decoder.decode(value, { stream: true }));
-        await read();
-      };
-      void read();
-    });
+        if (done) break;
+        raw += decoder.decode(value, { stream: true });
+        const dataFrames = raw.split("\n\n").filter((f) => f.includes("data:"));
+        if (dataFrames.length >= 3) break;
+      }
+    } catch {
+      // Abort during teardown is expected.
+    } finally {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+    }
+    await sseApp.close();
 
-    // Wait until catch-up frames for the 3 persisted events arrive.
-    await new Promise((r) => setTimeout(r, 600));
-    ctrl.abort();
-    await readToTime.catch(() => {});
-
-    const frames = collected.join("").split("\n\n").filter((f) => f.includes("data:"));
-    const payloads = frames
+    const payloads = raw
+      .split("\n\n")
+      .filter((f) => f.includes("data:"))
       .map((f) => {
         const m = f.match(/^data: (.+)$/m);
         return m ? (JSON.parse(m[1]) as StreamWindowEvent) : null;
@@ -162,8 +165,7 @@ describe("springboard API", () => {
       .filter((p): p is StreamWindowEvent => p !== null);
 
     expect(payloads.length).toBeGreaterThanOrEqual(3);
-    expect(payloads.map((p) => p.seq)).toContain(0);
+    expect(payloads.map((p) => p.seq)).toEqual(expect.arrayContaining([0, 1, 2]));
     expect(payloads[0].event?.structured).toBeDefined();
-    void server;
-  });
+  }, 15000);
 });

@@ -6,7 +6,7 @@ import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 
 /** Absolute path to the generated Drizzle migrations folder (`packages/db/drizzle`). */
-const MIGRATIONS_DIR = fileURLToPath(new URL("../../packages/db/drizzle", import.meta.url));
+const MIGRATIONS_DIR = fileURLToPath(new URL("../../../packages/db/drizzle", import.meta.url));
 
 async function main() {
   const cfg = loadConfig();
