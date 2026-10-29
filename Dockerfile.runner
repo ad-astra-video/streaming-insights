@@ -1,0 +1,47 @@
+# streaming-insights — Mage-VL SGLang runner image (GPU).
+#
+# Pinned to the measured .151 config (Phase 0b decision, ADAAAA-7547):
+#   * SGLang `feat/mage-vl` (kcz358/sglang), CUDA 13.0
+#   * `--video_backend codec`  (codec-native gate; the `frames` backend never
+#     fires the gate — measured pSpeak <= 0.002)
+#   * `--segment_sec` <= 16s   (8s default optimal; a 30s window does not
+#     trigger the gate)
+#
+# The base image is pre-built on the .151 box (see Phase 0b):
+#   mage-vl-sglang:cu130  (docker save | ssh load on the box)
+# If building from source instead:
+#   git clone https://github.com/kcz358/sglang.git
+#   cd sglang && git checkout feat/mage-vl
+#   pip install protobuf-compiler && rustup install 1.90.0
+#   pip install -e "python[all]"
+# then: docker build -f Dockerfile.runner -t mage-vl-sglang:cu130 .
+
+FROM pytorch/pytorch:2.8.0-cuda13.0-cudnn9-devel
+
+# Build deps for the SGLang feat/mage-vl build (protobuf + Rust 1.90.0).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        protobuf-compiler curl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /sglang
+RUN git clone https://github.com/kcz358/sglang.git . \
+    && git checkout feat/mage-vl
+RUN pip install --no-cache-dir -e "python[all]"
+
+# Model weights pulled at runtime (microsoft/Mage-VL).
+RUN mkdir -p /models
+ENV MODEL_PATH=/models/microsoft/Mage-VL
+
+# SGLang OpenAI-compatible server, pinned to the measured .151 config:
+#   --video_backend codec : codec-native gate (required)
+#   --segment_sec 8       : <=16s windows (8s optimal per measurement)
+#   --gate_threshold 0.5  : pSpeak >= 0.5 => speak
+EXPOSE 30000
+CMD ["python", "-m", "sglang.launch_server", \
+     "--model-path", "${MODEL_PATH}", \
+     "--served-model-name", "microsoft/Mage-VL", \
+     "--video_backend", "codec", \
+     "--segment_sec", "8", \
+     "--gate_threshold", "0.5"]

@@ -1,0 +1,16 @@
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+data/
+.pglite/
+*.log
+.DS_Store
+coverage/
+.idea/
+.vscode/
+.git/
