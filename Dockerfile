@@ -24,6 +24,13 @@ RUN pnpm install --frozen-lockfile=false && pnpm -r build
 
 FROM node:24-slim
 ENV NODE_ENV=production
+# ffmpeg is the WebRTC ingest decoder: services/media samples the received video
+# track by running short-lived ffmpeg decode passes on the buffered H264/VP8/VP9
+# segment. Without it every RTC session reports `packets>0 frames=0` — the stack
+# looks healthy while no window ever reaches the runner (Phase 7 deploy bug).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 COPY --from=build /repo/node_modules ./node_modules
 COPY --from=build /repo/packages ./packages

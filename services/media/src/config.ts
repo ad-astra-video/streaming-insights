@@ -34,6 +34,8 @@ export interface MediaConfig {
   provisionNoClientMs?: number;
   /** ICE servers (STUN/TURN) for WebRTC ingest. */
   rtcIceServers?: { urls: string | string[]; username?: string; credential?: string }[];
+  /** ffmpeg binary used by the WebRTC ingest decoder (default "ffmpeg"). */
+  ffmpegBin?: string;
 }
 
 export function loadMediaConfig(env: NodeJS.ProcessEnv = process.env): MediaConfig {
@@ -62,13 +64,37 @@ export function loadMediaConfig(env: NodeJS.ProcessEnv = process.env): MediaConf
       ? parseInt(env.MEDIA_PROVISION_NO_CLIENT_MS, 10)
       : undefined,
     rtcIceServers: env.RTC_ICE_SERVERS ? parseIceServers(env.RTC_ICE_SERVERS) : undefined,
+    ffmpegBin: env.FFMPEG_BIN || undefined,
   };
 }
 
-function parseIceServers(raw: string): { urls: string | string[] }[] {
+function parseIceServers(raw: string): { urls: string | string[]; username?: string; credential?: string }[] {
   return raw
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((urls) => ({ urls }));
+    .map(parseIceServer);
+}
+
+/**
+ * Parse one ICE entry. Plain `stun:host:port` / `turn:host:port?transport=udp`
+ * entries pass through untouched. A TURN entry may carry its credentials the
+ * way the box env ships them — `turn:user:pass@host:port?transport=udp` — in
+ * which case the userinfo is split off into `username`/`credential`, because
+ * the browser's RTCIceServer needs them as separate fields (a credential left
+ * inside the URL is ignored by Chrome/werift and the relay allocation fails
+ * with a 401).
+ */
+export function parseIceServer(entry: string): { urls: string; username?: string; credential?: string } {
+  const at = entry.indexOf("@");
+  if (at === -1) return { urls: entry };
+  const schemeEnd = entry.indexOf(":");
+  if (schemeEnd === -1 || schemeEnd > at) return { urls: entry };
+  const scheme = entry.slice(0, schemeEnd + 1);
+  const userinfo = entry.slice(schemeEnd + 1, at);
+  const hostpart = entry.slice(at + 1);
+  const sep = userinfo.indexOf(":");
+  const username = decodeURIComponent(sep === -1 ? userinfo : userinfo.slice(0, sep));
+  const credential = sep === -1 ? "" : decodeURIComponent(userinfo.slice(sep + 1));
+  return { urls: `${scheme}${hostpart}`, username, credential };
 }

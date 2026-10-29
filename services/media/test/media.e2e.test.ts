@@ -216,6 +216,17 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
       expect(typeof e.tokens.baselineDense).toBe("number");
       expect(typeof e.tokens.generated).toBe("number");
       expect(typeof e.tokens.savedVsBaseline).toBe("number");
+      // CONTRACT REGRESSIONS (Phase 7 deploy bugs found on .151):
+      //  - savedVsBaseline is a FRACTION; a token count made the feed print
+      //    "saved 69000%".
+      //  - window bounds are session-RELATIVE seconds; a raw epoch value
+      //    rendered as "1793311118.5s" in the dashboard.
+      //  - a silent window generates 0 response tokens.
+      expect(e.tokens.savedVsBaseline).toBeGreaterThanOrEqual(0);
+      expect(e.tokens.savedVsBaseline).toBeLessThanOrEqual(1);
+      expect(e.tStart).toBeLessThan(3600);
+      expect(e.tEnd).toBeGreaterThanOrEqual(e.tStart);
+      if (e.gate.decision === "silent") expect(e.tokens.generated).toBe(0);
     }
 
     // fake runner was actually dispatched for each window

@@ -274,6 +274,25 @@ importers:
         specifier: ^2.1.9
         version: 2.1.9(@types/node@22.20.5)
 
+  services/runner-adapter:
+    dependencies:
+      fastify:
+        specifier: ^5.12.7
+        version: 5.12.7
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.5
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.15
+      typescript:
+        specifier: ^5.6.3
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.9
+        version: 2.1.9(@types/node@22.20.5)
+
   services/server:
     dependencies:
       '@fastify/cors':

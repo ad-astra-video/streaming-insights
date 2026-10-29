@@ -16,6 +16,7 @@
 //   POST /sessions/:sid/close     force close + release the runner slot
 //   GET  /health
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
@@ -47,6 +48,10 @@ interface ActiveStream {
   runner: MageRunnerClient;
   windowsPosted: number;
   eventsPosted: number;
+  /** Session-relative clock origin (epoch seconds of the first dispatched
+   *  window). Windows report tStart/tEnd RELATIVE to this so the dashboard
+   *  renders `12.3s–13.4s` instead of a raw epoch seconds value. */
+  t0?: number;
 }
 
 export interface MediaServerDeps {
@@ -68,6 +73,10 @@ export class MediaServer {
   private control: ControlClient | LocalControlClient;
   private runner: MageRunnerClient;
   private cfg: MediaConfig;
+  /** Rate-limit gate for ffmpeg decode diagnostics. */
+  private lastFfmpegWarnAt = 0;
+  /** True when the ffmpeg binary the RTC decoder shells out to is present. */
+  private ffmpegAvailable = false;
 
   constructor(deps: MediaServerDeps) {
     this.cfg = deps.cfg;
@@ -92,6 +101,16 @@ export class MediaServer {
 
   async build(): Promise<FastifyInstance> {
     const app = Fastify({ logger: false });
+    // WebRTC ingest decodes through the ffmpeg binary. Probe it once at boot so
+    // a packaging regression is loud instead of a silent `frames=0`.
+    this.ffmpegAvailable = spawnSync(this.cfg.ffmpegBin ?? "ffmpeg", ["-version"], { encoding: "utf8" }).status === 0;
+    if (!this.ffmpegAvailable) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[media] ffmpeg binary not found on PATH — WebRTC ingest will decode 0 frames " +
+          "(the WSS frame rail still works). Install ffmpeg in the image or set FFMPEG_BIN.",
+      );
+    }
     app.register(cors, { origin: true });
     await app.register(websocket, { options: { maxPayload: 4 * 1024 * 1024 } });
 
@@ -171,6 +190,16 @@ export class MediaServer {
           if (stream.sockets.size === 0) this.armGrace(req.params.sid);
         });
         session.on("error", (e) => console.error("[media] rtc err", e));
+        // Decode diagnostics: a missing/failing ffmpeg used to be invisible —
+        // the session logged `packets>0 frames=0` and no window reached the
+        // runner. Surface it loudly and rate-limit (one line per 5s).
+        session.on("ffmpeg", (msg: string) => {
+          const now = Date.now();
+          if (now - this.lastFfmpegWarnAt > 5000) {
+            this.lastFfmpegWarnAt = now;
+            console.error("[media] ffmpeg decode:", msg);
+          }
+        });
         stream.rtc = { pcId: randomUUID(), session };
         this.clearNoClient(req.params.sid);
       }
@@ -244,7 +273,7 @@ export class MediaServer {
         eventsPosted: s.eventsPosted,
         closed: s.closed,
       }));
-      return { status: "ok", activeSessions: sessions };
+      return { status: "ok", activeSessions: sessions, decode: { ffmpeg: this.ffmpegAvailable } };
     });
 
     // Alias for the deploy health probe (compose hits /api/health).
@@ -256,7 +285,7 @@ export class MediaServer {
         eventsPosted: s.eventsPosted,
         closed: s.closed,
       }));
-      return { status: "ok", activeSessions: sessions };
+      return { status: "ok", activeSessions: sessions, decode: { ffmpeg: this.ffmpegAvailable } };
     });
 
     return app;
@@ -287,31 +316,45 @@ export class MediaServer {
   private async handleWindow(stream: ActiveStream, window: CodecWindow): Promise<void> {
     if (stream.closed) return;
     const outcome: WindowOutcome = await stream.runner.driveWindow(window, stream.prompt);
+    // Session-relative window bounds (the webapp renders these as seconds since
+    // the stream started; raw epoch seconds rendered as e.g. `1793311118.5s`).
+    if (stream.t0 === undefined) stream.t0 = window.tStart;
+    const tStart = Math.max(window.tStart - stream.t0, 0);
+    const tEnd = Math.max(window.tEnd - stream.t0, tStart);
+    // A silent window generates no response tokens by contract; the runner may
+    // still report a speculative count, so normalize here instead of letting a
+    // silent window show "generated N tokens".
+    const generated = outcome.decision === "silent" ? 0 : outcome.tokensGenerated;
     // 1) token-ledger row.
     const ledger: LedgerWindowPayload = {
       seq: window.seq,
-      tStart: window.tStart,
-      tEnd: window.tEnd,
+      tStart,
+      tEnd,
       pSpeak: outcome.pSpeak,
       decision: outcome.decision,
       tokensVisual: outcome.tokensVisual,
       tokensBaselineDense: outcome.tokensBaselineDense,
-      tokensGenerated: outcome.tokensGenerated,
+      tokensGenerated: generated,
       prompt: stream.prompt,
       responseText: outcome.responseText ?? undefined,
     };
     // 2) springboard event (gate + tokens + text).
     const saved = Math.max(outcome.tokensBaselineDense - outcome.tokensVisual, 0);
+    // CONTRACT: `savedVsBaseline` is a FRACTION (1 - visual/baselineDense), not
+    // the saved token COUNT. Emitting the count made the webapp feed print
+    // "saved 69000%".
+    const savedVsBaseline =
+      outcome.tokensBaselineDense > 0 ? Math.min(saved / outcome.tokensBaselineDense, 1) : 0;
     const event: EventPayload = {
       seq: window.seq,
-      tStart: window.tStart,
-      tEnd: window.tEnd,
+      tStart,
+      tEnd,
       gate: { pSpeak: outcome.pSpeak, decision: outcome.decision },
       tokens: {
         visual: outcome.tokensVisual,
         baselineDense: outcome.tokensBaselineDense,
-        generated: outcome.tokensGenerated,
-        savedVsBaseline: saved,
+        generated,
+        savedVsBaseline,
       },
       prompt: stream.prompt,
       event: {

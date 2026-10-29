@@ -2,6 +2,7 @@ packages:
   - "packages/*"
   - "services/server"
   - "services/media"
+  - "services/runner-adapter"
   - "webapp"
 
 # pnpm 12 blocks native build (postinstall) scripts by default and fails the

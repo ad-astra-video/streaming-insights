@@ -36,6 +36,16 @@ describe("media config: runner selection", () => {
       "turn:turn.example.com:3478",
     ]);
   });
+
+  it("splits embedded TURN credentials into username/credential", () => {
+    const cfg = loadMediaConfig({
+      RTC_ICE_SERVERS: "stun:stun.l.google.com:19302,turn:alice:s3cr3t@136.33.135.223:3478?transport=udp",
+    } as NodeJS.ProcessEnv);
+    expect(cfg.rtcIceServers).toEqual([
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "turn:136.33.135.223:3478?transport=udp", username: "alice", credential: "s3cr3t" },
+    ]);
+  });
 });
 
 describe("HttpRunnerClient base normalization", () => {

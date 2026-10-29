@@ -85,6 +85,8 @@ services:
     depends_on:
       control:
         condition: service_healthy
+      adapter:
+        condition: service_healthy
     environment:
       - NODE_ENV=production
       - PORT=4070
@@ -93,15 +95,13 @@ services:
       - CONTROL_BASE_URL=http://control:3100
       # Mage-VL window runner. Contract: POST ${RUNNER_BASE_URL}/v1/mage/window
       # -> { pSpeak, decision, tokensVisual, tokensBaselineDense,
-      #      tokensGenerated, responseText }. The box's SGLang server on :30000
-      # only serves the OpenAI routes (no /v1/mage/window yet), so this deploy
-      # keeps the in-process mock runner ON to keep the
-      # browser -> media -> control -> dashboard path live. Set
-      # MOCK_RUNNER=false (and a real adapter URL) once the window endpoint
-      # exists; media now defaults to the REAL runner whenever a base URL is set
-      # and the mock is explicitly opted into.
-      - RUNNER_BASE_URL=${RUNNER_BASE_URL:-http://runner:30000/v1}
-      - MOCK_RUNNER=${MOCK_RUNNER:-true}
+      #      tokensGenerated, responseText }. The `adapter` service below bridges
+      # that contract onto the box's stock SGLang Mage-VL server (which only
+      # serves the OpenAI routes), so dispatch runs on the REAL GPU model.
+      # MOCK_RUNNER is an explicit opt-in for GPU-less environments; it defaults
+      # to false so a deploy cannot silently skip the runner.
+      - RUNNER_BASE_URL=${RUNNER_BASE_URL:-http://adapter:4180}
+      - MOCK_RUNNER=${MOCK_RUNNER:-false}
       - MEDIA_PUBLIC_BASE_URL=${MEDIA_PUBLIC_BASE_URL:-https://si-media.example.com}
       - RTC_SAMPLE_FPS=${RTC_SAMPLE_FPS:-1}
       - WINDOW_FRAMES=${WINDOW_FRAMES:-2}
@@ -121,10 +121,55 @@ services:
     networks: [si]
     restart: unless-stopped
 
+  # Mage-VL window adapter: bridges the media server's /v1/mage/window contract
+  # onto the box's SGLang Mage-VL runner (OpenAI-compatible routes only). Runs
+  # the SAME image with a different command, so a deploy has no extra build.
+  adapter:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: streaming-insights:control
+    container_name: si-adapter
+    command: ["node", "services/runner-adapter/dist/index.js"]
+    depends_on:
+      control:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=4180
+      # OpenAI-compatible base of the Mage-VL SGLang server. On the .151 box the
+      # runner is the standalone `mage-vl-server` container published on the host
+      # at :30000 (see the gated `runner` service below).
+      - RUNNER_UPSTREAM=${RUNNER_UPSTREAM:-http://192.168.1.151:30000/v1}
+      - RUNNER_MODEL=${RUNNER_MODEL:-microsoft/Mage-VL}
+      - GATE_THRESHOLD=${GATE_THRESHOLD:-0.5}
+      - DENSE_TOKENS_PER_FRAME=${DENSE_TOKENS_PER_FRAME:-576}
+      - MAX_FRAMES_PER_WINDOW=${MAX_FRAMES_PER_WINDOW:-2}
+      - RUNNER_MAX_TOKENS=${RUNNER_MAX_TOKENS:-128}
+      - RUNNER_TEMPERATURE=${RUNNER_TEMPERATURE:-0}
+      - RUNNER_TIMEOUT_MS=${RUNNER_TIMEOUT_MS:-60000}
+    expose:
+      - "4180"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4180/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [si]
+    restart: unless-stopped
+
   runner:
     # One container per 5090 GPU. Use the prebuilt box image mage-vl-sglang:cu130
     # (saved/loaded on the box per Phase 0b) by default; set RUNNER_BUILD=true to
     # build from Dockerfile.runner instead.
+    #
+    # Gated behind the `runner` profile: the .151 box already runs the Mage-VL
+    # SGLang server as a standalone `mage-vl-server` container (Phase 3) that owns
+    # :30000 and GPU 0, so starting this service unconditionally fails with
+    # "Bind for 0.0.0.0:30000 failed: port is already allocated". Bring it up only
+    # on a box that does not already have the runner: docker compose --profile runner up -d
+    profiles: ["runner"]
     image: ${RUNNER_IMAGE:-mage-vl-sglang:cu130}
     container_name: si-runner-0
     environment:
