@@ -61,6 +61,15 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     schema: streamWindowEventJsonSchema,
   }));
 
+  // Runtime wiring for the browser: the public media origin to ingest against.
+  // Served from the COMMITTED compose env so the webapp never has to guess the
+  // docker-internal media hostname (or a build-time constant baked per box).
+  app.get(ROUTES.config, async () => ({
+    version: CONTRACT_VERSION,
+    mediaBaseUrl: cfg.mediaPublicBaseUrl ?? null,
+    controlBaseUrl: cfg.publicBaseUrl ?? null,
+  }));
+
   // Live SSE feed: catch up on persisted events, then stream new ones as they
   // are written to the event store.
   app.get(ROUTES.sessionEvents(":sessionId"), async (req, reply) => {

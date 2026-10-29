@@ -12,6 +12,11 @@ export interface ServerConfig {
   runnerHeartbeatTtlMs: number;
   /** Live SSE feed poll interval (ms) — how often the server checks the event table. */
   ssePollMs: number;
+  /** Public media origin handed to the browser for WebRTC signaling / WSS
+   *  ingest (never the docker-internal hostname). */
+  mediaPublicBaseUrl?: string;
+  /** Public control origin (this server), for same-origin/link building. */
+  publicBaseUrl?: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -27,5 +32,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     maxStreams,
     runnerHeartbeatTtlMs: parseInt(env.RUNNER_HEARTBEAT_TTL_MS ?? "15000", 10),
     ssePollMs: parseInt(env.SSE_POLL_MS ?? "1000", 10),
+    mediaPublicBaseUrl: env.MEDIA_PUBLIC_BASE_URL || undefined,
+    publicBaseUrl: env.PUBLIC_BASE_URL || undefined,
   };
 }

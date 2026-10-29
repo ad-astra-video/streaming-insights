@@ -20,7 +20,15 @@ export interface MageRunnerClient {
  *  runner's OpenAI-compatible streaming endpoint and reads back the telemetry
  *  line. Replaced by the real SGLang `feat/mage-vl` serving runtime. */
 export class HttpRunnerClient implements MageRunnerClient {
-  constructor(private base: string) {}
+  /** Base URL without a trailing slash or a trailing `/v1` version segment:
+   *  the window route appends `/v1/mage/window`, and deployed env sets
+   *  RUNNER_BASE_URL=http://host:port/v1 (OpenAI-compatible base), which used
+   *  to produce `/v1/v1/mage/window` -> 404. */
+  private readonly base: string;
+
+  constructor(base: string) {
+    this.base = base.trim().replace(/\/+$/, "").replace(/\/v1$/, "");
+  }
 
   async driveWindow(window: CodecWindow, prompt?: string): Promise<WindowOutcome> {
     const res = await fetch(`${this.base}/v1/mage/window`, {

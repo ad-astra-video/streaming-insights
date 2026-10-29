@@ -1,0 +1,159 @@
+# streaming-insights — Mage-VL proactive-streaming showcase stack.
+#
+# Mirrors the highlights.live control-plane/media-server split:
+#   * db       Postgres (control-plane DB). The control server falls back to
+#              embedded PGlite when DATABASE_URL is unset, but the box deploy
+#              runs Postgres so the ledger/schema persist across recreate.
+#   * control  build/. control server (:3100) — serves the REST/SSE /api
+#              surface AND the built webapp bundle (webapp/dist) at /. Built
+#              from the repo-root Dockerfile.
+#   * media    public media origin (:4070), werift WebRTC ingest, CORS-enabled,
+#              POSTs windows/events to control and dispatches windows to the
+#              Mage-VL runner. Started from the SAME control image with a
+#              different command.
+#   * runner   Mage-VL SGLang GPU runner (:30000). One container per 5090 GPU
+#              (the .151 box has 5090x3). Use the prebuilt box image
+#              mage-vl-sglang:cu130 by default; set RUNNER_BUILD=true to build
+#              from Dockerfile.runner.
+#
+# ENV is wired in the COMMITTED environment blocks below (${VAR:-default}
+# substitution); secret/value overrides come from docker/.env on the box.
+#
+#   docker compose -f docker/docker-compose.yml up -d --build
+name: streaming-insights
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: si-db
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-streaming}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-streaming}
+      - POSTGRES_DB=${POSTGRES_DB:-streaming}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-streaming} -d ${POSTGRES_DB:-streaming}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks: [si]
+    restart: unless-stopped
+
+  control:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: streaming-insights:control
+    container_name: si-control
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=3100
+      - DATABASE_URL=postgres://${POSTGRES_USER:-streaming}:${POSTGRES_PASSWORD:-streaming}@db:5432/${POSTGRES_DB:-streaming}
+      - RUNNERS=${RUNNERS:-3}
+      - STREAMS_PER_RUNNER=${STREAMS_PER_RUNNER:-3}
+      - MAX_STREAMS=${MAX_STREAMS:-9}
+      # Public media origin handed to the browser for RTC signaling (ADAAAA-7286
+      # class bug: must be the PUBLIC origin, never the docker-internal
+      # control/media hostname). Wired here so a recreate keeps it.
+      - MEDIA_PUBLIC_BASE_URL=${MEDIA_PUBLIC_BASE_URL:-https://si-media.example.com}
+      # Public control origin the webapp calls back to. Wired here (not
+      # box-local) so a clean reconcile does not silently drop it.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://si-control.example.com}
+    ports:
+      - "${CONTROL_PORT:-3100}:3100"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [si]
+    restart: unless-stopped
+
+  media:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: streaming-insights:control
+    container_name: si-media
+    command: ["node", "services/media/dist/index.js"]
+    depends_on:
+      control:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=4070
+      # Control server the media server reserves runner slots on + POSTs
+      # windows/events/prompts to (docker-internal).
+      - CONTROL_BASE_URL=http://control:3100
+      # Mage-VL window runner. Contract: POST ${RUNNER_BASE_URL}/v1/mage/window
+      # -> { pSpeak, decision, tokensVisual, tokensBaselineDense,
+      #      tokensGenerated, responseText }. The box's SGLang server on :30000
+      # only serves the OpenAI routes (no /v1/mage/window yet), so this deploy
+      # keeps the in-process mock runner ON to keep the
+      # browser -> media -> control -> dashboard path live. Set
+      # MOCK_RUNNER=false (and a real adapter URL) once the window endpoint
+      # exists; media now defaults to the REAL runner whenever a base URL is set
+      # and the mock is explicitly opted into.
+      - RUNNER_BASE_URL=${RUNNER_BASE_URL:-http://runner:30000/v1}
+      - MOCK_RUNNER=${MOCK_RUNNER:-true}
+      - MEDIA_PUBLIC_BASE_URL=${MEDIA_PUBLIC_BASE_URL:-https://si-media.example.com}
+      - RTC_SAMPLE_FPS=${RTC_SAMPLE_FPS:-1}
+      - WINDOW_FRAMES=${WINDOW_FRAMES:-2}
+      - GATE_THRESHOLD=${GATE_THRESHOLD:-0.5}
+      # STUN/TURN for WebRTC ingest. Comma-separated list of ICE URLs. TURN is
+      # required for browsers behind symmetric NAT; wired here (committed) with
+      # values in docker/.env.
+      - RTC_ICE_SERVERS=${RTC_ICE_SERVERS:-stun:stun.l.google.com:19302}
+    ports:
+      - "${MEDIA_PORT:-4070}:4070"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4070/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [si]
+    restart: unless-stopped
+
+  runner:
+    # One container per 5090 GPU. Use the prebuilt box image mage-vl-sglang:cu130
+    # (saved/loaded on the box per Phase 0b) by default; set RUNNER_BUILD=true to
+    # build from Dockerfile.runner instead.
+    image: ${RUNNER_IMAGE:-mage-vl-sglang:cu130}
+    container_name: si-runner-0
+    environment:
+      - MODEL_PATH=${MODEL_PATH:-/models/microsoft/Mage-VL}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+    volumes:
+      - ${MODELS_DIR:-/home/brad/mage_vl/models}:/models
+    expose:
+      - "30000"
+    ports:
+      - "${RUNNER_PORT:-30000}:30000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:30000/v1/models',timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
+    networks: [si]
+    restart: unless-stopped
+
+networks:
+  si:
+
+volumes:
+  pgdata:

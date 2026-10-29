@@ -45,7 +45,11 @@ export function loadMediaConfig(env: NodeJS.ProcessEnv = process.env): MediaConf
     publicBaseUrl: env.MEDIA_PUBLIC_BASE_URL || undefined,
     controlBase,
     runnerBase,
-    mockRunner: runnerBase ? env.MOCK_RUNNER !== "false" : true,
+    // A configured runner URL means "use the real Mage-VL runner"; the mock is
+    // opt-in via MOCK_RUNNER=true. The previous default (`!== "false"`) made an
+    // env-only deploy silently dispatch to the in-process mock, so the stack
+    // looked healthy end-to-end while never touching the GPU runner.
+    mockRunner: runnerBase ? env.MOCK_RUNNER === "true" : true,
     sampleFps: parseFloat(env.RTC_SAMPLE_FPS ?? "1"),
     windowFrames: parseInt(env.WINDOW_FRAMES ?? "2", 10),
     gateThreshold: parseFloat(env.GATE_THRESHOLD ?? "0.5"),

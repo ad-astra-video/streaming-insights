@@ -18,4 +18,6 @@ export const ROUTES = {
   /** JSON Schema for the event contract. */
   schema: `${API_PREFIX}/schema`,
   health: `${API_PREFIX}/health`,
+  /** Runtime wiring the browser needs (public media origin for ingest). */
+  config: `${API_PREFIX}/config`,
 } as const;

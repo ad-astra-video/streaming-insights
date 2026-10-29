@@ -9,6 +9,8 @@ import { StatusBadge, type SessionStatus } from "./components/StatusBadge";
 import { SimFeed, SIM_EMIT_MS } from "./sim/simSource";
 import { openLiveFeed } from "./lib/springboard";
 import { startSimCanvas } from "./lib/canvas";
+import { startIngest, type IngestSession, type IngestStatus } from "./lib/ingest";
+import { loadRuntimeConfig, resolveMediaBaseUrl, type RuntimeConfig } from "./lib/runtimeConfig";
 
 const DEMO_SESSION_ID = "demo-session";
 
@@ -19,6 +21,7 @@ export function App() {
   const [prompt, setPrompt] = useState("");
   const [activePrompt, setActivePrompt] = useState<string | null>(null);
   const [events, setEvents] = useState<StreamWindowEvent[]>([]);
+  const [transport, setTransport] = useState<"webrtc" | "ws" | null>(null);
   const [sessionId, setSessionId] = useState<string>(
     () => new URLSearchParams(window.location.search).get("session") ?? ""
   );
@@ -32,6 +35,14 @@ export function App() {
   const simFeedRef = useRef<SimFeed | null>(null);
   const activePromptRef = useRef<string | null>(null);
   const sessionIdRef = useRef(sessionId);
+  const ingestRef = useRef<IngestSession | null>(null);
+  const runtimeConfigRef = useRef<RuntimeConfig | null>(null);
+
+  useEffect(() => {
+    void loadRuntimeConfig().then((cfg) => {
+      runtimeConfigRef.current = cfg;
+    });
+  }, []);
 
   activePromptRef.current = activePrompt;
   sessionIdRef.current = sessionId;
@@ -56,6 +67,10 @@ export function App() {
       closeFeedRef.current();
       closeFeedRef.current = null;
     }
+    if (ingestRef.current) {
+      void ingestRef.current.close().catch(() => {});
+      ingestRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       mediaStreamRef.current = null;
@@ -72,6 +87,7 @@ export function App() {
       setEvents([]);
       setSource(kind);
       setStatus("starting");
+      setTransport(null);
 
       if (kind === "sim") {
         simFeedRef.current = new SimFeed({ sessionId: DEMO_SESSION_ID });
@@ -101,6 +117,46 @@ export function App() {
           await v.play().catch(() => {});
         }
         setStatus("live");
+
+        // Real ingest: provision a media session and stream this preview to the
+        // media server (WebRTC preferred, WSS frame rail as the fallback). The
+        // media server closes windows, dispatches them to the Mage-VL runner and
+        // POSTs the telemetry to the control plane, which the SSE feed below
+        // then renders. Without this the webapp only previewed locally and the
+        // dashboard never saw data produced by the browser stream.
+        if (!sessionIdRef.current) {
+          try {
+            const ingest = await startIngest({
+              stream,
+              mediaBaseUrl: resolveMediaBaseUrl(runtimeConfigRef.current),
+              prompt: activePromptRef.current,
+              sampleFps: 2,
+              onStatus: (s: IngestStatus) => {
+                if (s.state === "live") setTransport(s.transport);
+                if (s.state === "error") {
+                  setStatus("error");
+                  setError(s.message);
+                }
+              },
+            });
+            ingestRef.current = ingest;
+            setSessionId(ingest.sessionId);
+            sessionIdRef.current = ingest.sessionId;
+            closeFeedRef.current = openLiveFeed({
+              sessionId: ingest.sessionId,
+              onEvent: addEvent,
+              onStatus: (s) => {
+                if (s === "error") setStatus("error");
+              },
+            });
+          } catch (e) {
+            setStatus("error");
+            setError(
+              e instanceof Error ? `Live ingest failed: ${e.message}` : "Live ingest failed."
+            );
+            return;
+          }
+        }
 
         // If a live session id is set, attach the real springboard SSE feed so
         // the webapp is a genuine consumer of the control-plane event stream.
@@ -133,8 +189,9 @@ export function App() {
     const trimmed = prompt.trim();
     if (!trimmed) return;
     setActivePrompt(trimmed);
-    // For a real session we would also PATCH the prompt to the control server;
-    // that endpoint is provisioned by the pipeline phases, not this MVP screen.
+    // Push the prompt to the live media session so the next window's runner
+    // dispatch uses it (previously this only updated local state).
+    void ingestRef.current?.setPrompt(trimmed).catch(() => {});
   }, [prompt]);
 
   const isLive = status === "live";
@@ -243,6 +300,11 @@ export function App() {
           The webapp also consumes the structured data-out feed:{" "}
           <code>/api/sessions/&lt;id&gt;/events</code> (SSE).
         </p>
+        {transport ? (
+          <p className="prompt-current">
+            Ingest transport: <code>{transport}</code>
+          </p>
+        ) : null}
       </section>
     </div>
   );
