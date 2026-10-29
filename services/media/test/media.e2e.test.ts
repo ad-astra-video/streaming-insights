@@ -16,7 +16,9 @@ import { openPgliteDb } from "../../server/src/db";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import type { ServerConfig } from "../../server/src/config";
 
-const SERVER_MIGRATIONS_DIR = path.resolve(import.meta.dirname, "../../server/drizzle");
+// Canonical control-plane migrations live in packages/db (the union merge on
+// ADAAAA-7578 consolidated origin services/server/drizzle into packages/db).
+const SERVER_MIGRATIONS_DIR = path.resolve(import.meta.dirname, "../../../packages/db/drizzle");
 
 /** Deterministic runner so the E2E reliably produces BOTH a silent (gate
  *  savings) and a speak (text) window. */
@@ -55,6 +57,7 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
       streamsPerRunner: 3,
       maxStreams: 9,
       runnerHeartbeatTtlMs: 15000,
+      ssePollMs: 100,
     };
     const { db } = await openPgliteDb();
     await migrate(db, { migrationsFolder: SERVER_MIGRATIONS_DIR });
@@ -66,7 +69,8 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
     const rr = await ctrl.inject({
       method: "POST",
       url: "/runners",
-      payload: { name: "runner-0", gpuIndex: 0, host: "box-151" },
+      // Deploy-tree runner contract (packages/db runners table).
+      payload: { gpu: 0, capacity: 3 },
     });
     runnerId = rr.json().id;
 

@@ -255,9 +255,15 @@ importers:
         specifier: ^0.24.4
         version: 0.24.4
     devDependencies:
+      '@electric-sql/pglite':
+        specifier: ^0.5.13
+        version: 0.5.13
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.5
+      drizzle-orm:
+        specifier: ^0.36.4
+        version: 0.36.4(@electric-sql/pglite@0.5.13)(@types/react@19.3.0)(postgres@3.4.9)(react@19.3.1)
       tsx:
         specifier: ^4.19.2
         version: 4.23.15

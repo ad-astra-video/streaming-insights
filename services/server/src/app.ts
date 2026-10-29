@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
-import { asc, eq, gt } from "drizzle-orm";
+import { and, asc, eq, gt } from "drizzle-orm";
 import { events, sessions, tokenLedger } from "@streaming-insights/db";
 import { ROUTES, streamWindowEventJsonSchema, CONTRACT_VERSION } from "@streaming-insights/shared";
 import type { Db } from "./db.js";
@@ -36,7 +36,7 @@ async function listEventsAfter(db: Db, sessionId: string, afterSeq: number): Pro
   const rows = await db
     .select({ seq: events.seq, payload: events.payload })
     .from(events)
-    .where(gt(events.seq, afterSeq))
+    .where(and(eq(events.sessionId, sessionId), gt(events.seq, afterSeq)))
     .orderBy(asc(events.seq));
   return rows as EventRow[];
 }

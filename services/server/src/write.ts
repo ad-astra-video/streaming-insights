@@ -5,7 +5,7 @@
 // control server. This module registers those write routes against the deploy
 // tree's `packages/db` schema so the springboard READ path (SSE / NDJSON /
 // token-summary in app.ts) and the media WRITE path share the same tables.
-import { and, desc, eq, lte } from "drizzle-orm";
+import { and, asc, desc, eq, lte } from "drizzle-orm";
 import { events, prompts, runners, sessions, tokenLedger } from "@streaming-insights/db";
 import type { FastifyInstance } from "fastify";
 import type { Db } from "./db.js";
@@ -41,7 +41,17 @@ export function registerWriteRoutes(
   cfg: ServerConfig
 ): void {
   // --- Runners ---
-  app.get("/runners", async () => ({ runners: await db.select().from(runners).orderBy(desc(runners.gpu)) }));
+  app.get("/runners", async () => {
+    // Expose occupied slots alongside free/total, mirroring the reservation
+    // response the media server consumes (origin Phase 1 runner contract).
+    const rows = await db.select().from(runners).orderBy(desc(runners.gpu));
+    return {
+      runners: rows.map((r) => ({
+        ...r,
+        slotsUsed: Math.max(r.totalSlots - r.freeSlots, 0),
+      })),
+    };
+  });
 
   app.post<{ Body: { gpu: number; capacity?: number } }>("/runners", async (req, reply) => {
     const gpu = req.body?.gpu;
@@ -204,6 +214,24 @@ export function registerWriteRoutes(
     return reply.code(201).send(row);
   });
 
+  // --- Token ledger read path (media/ingest inspection, origin Phase 1 API) ---
+  app.get<{ Params: { id: string } }>("/stream-sessions/:id/windows", async (req, reply) => {
+    const session = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.id, req.params.id))
+      .limit(1);
+    if (session.length === 0) {
+      return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
+    }
+    const rows = await db
+      .select()
+      .from(tokenLedger)
+      .where(eq(tokenLedger.sessionId, req.params.id))
+      .orderBy(asc(tokenLedger.seq));
+    return { windows: rows };
+  });
+
   // --- Springboard events (data-out) ---
   app.post<{
     Params: { id: string };
@@ -243,6 +271,32 @@ export function registerWriteRoutes(
       })
       .returning();
     return reply.code(201).send(row);
+  });
+
+  // --- Event read path: the persisted per-window springboard event, flattened
+  // from the `events.payload` jsonb back to the media/ingest POST body shape so
+  // an ingest can be inspected end-to-end (gate + tokens + text).
+  app.get<{ Params: { id: string } }>("/stream-sessions/:id/events", async (req, reply) => {
+    const session = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.id, req.params.id))
+      .limit(1);
+    if (session.length === 0) {
+      return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
+    }
+    const rows = await db
+      .select()
+      .from(events)
+      .where(eq(events.sessionId, req.params.id))
+      .orderBy(asc(events.seq));
+    return {
+      events: rows.map((r) => ({
+        ...(r.payload as Record<string, unknown>),
+        id: r.id,
+        createdAt: r.ts,
+      })),
+    };
   });
 
   // --- Stale runner reclaim (mark down + release sessions) ---

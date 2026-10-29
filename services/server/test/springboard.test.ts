@@ -116,6 +116,32 @@ describe("springboard API", () => {
     expect(body.savedVsBaseline).toBeCloseTo((1200 - 303) / 1200, 5);
   });
 
+  it("scopes the event feed to the requested session (no cross-session leakage)", async () => {
+    // A second stream session persisting events with overlapping seq numbers.
+    const [other] = await db.insert(sessions).values({ status: "streaming" }).returning();
+    await db.insert(events).values([
+      { sessionId: other.id, seq: 0, payload: makeEvent(0, { tile: "other-0" }), ts: new Date() },
+      { sessionId: other.id, seq: 1, payload: makeEvent(1, { tile: "other-1" }), ts: new Date() },
+    ]);
+
+    const mine = await app.inject({ method: "GET", url: `/api/sessions/${sessionId}/events.ndjson` });
+    expect(mine.statusCode).toBe(200);
+    const mineLines = mine.body.trim().split("\n").map((l) => JSON.parse(l) as StreamWindowEvent);
+    expect(mineLines).toHaveLength(3);
+    const mineTiles = mineLines
+      .map((w) => (w.event?.structured as { tile?: string } | undefined)?.tile)
+      .filter((t): t is string => !!t);
+    expect(mineTiles).toEqual(["person", "empty", "car"]);
+
+    // The other session sees exactly its own two events, not a superset.
+    const theirs = await app.inject({ method: "GET", url: `/api/sessions/${other.id}/events.ndjson` });
+    const theirLines = theirs.body.trim().split("\n").map((l) => JSON.parse(l) as StreamWindowEvent);
+    expect(theirLines).toHaveLength(2);
+    expect(
+      theirLines.map((w) => (w.event?.structured as { tile?: string } | undefined)?.tile)
+    ).toEqual(["other-0", "other-1"]);
+  });
+
   it("returns 404 for an unknown session", async () => {
     const res = await app.inject({ method: "GET", url: "/api/sessions/00000000-0000-0000-0000-000000000000/events.ndjson" });
     expect(res.statusCode).toBe(404);
