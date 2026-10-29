@@ -265,28 +265,26 @@ export class MediaServer {
       return { ok: true };
     });
 
-    app.get("/health", async () => {
-      const sessions = [...this.active.values()].map((s) => ({
+    const healthBody = () => ({
+      status: "ok",
+      activeSessions: [...this.active.values()].map((s) => ({
         sid: s.sid,
         source: s.source,
         windowsPosted: s.windowsPosted,
         eventsPosted: s.eventsPosted,
         closed: s.closed,
-      }));
-      return { status: "ok", activeSessions: sessions, decode: { ffmpeg: this.ffmpegAvailable } };
+        // Per-session RTC ingest counters + ICE diagnostics, so a stalled
+        // ingest is observable without a browser and without container logs
+        // (`packetsReceived=0` + `iceState="checking"` = ICE never completed).
+        ...(s.rtc ? { rtc: s.rtc.session.stats() } : {}),
+      })),
+      decode: { ffmpeg: this.ffmpegAvailable },
     });
 
+    app.get("/health", async () => healthBody());
+
     // Alias for the deploy health probe (compose hits /api/health).
-    app.get("/api/health", async () => {
-      const sessions = [...this.active.values()].map((s) => ({
-        sid: s.sid,
-        source: s.source,
-        windowsPosted: s.windowsPosted,
-        eventsPosted: s.eventsPosted,
-        closed: s.closed,
-      }));
-      return { status: "ok", activeSessions: sessions, decode: { ffmpeg: this.ffmpegAvailable } };
-    });
+    app.get("/api/health", async () => healthBody());
 
     return app;
   }
