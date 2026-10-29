@@ -1,8 +1,18 @@
 node_modules/
-pnpm-lock.yaml
 dist/
 build/
 *.tsbuildinfo
-.DS_Store
-.vite/
+.env
+.env.*
+!.env.example
+data/
+.pglite/
 *.log
+.DS_Store
+coverage/
+.idea/
+.vscode/
+
+# local git plumbing (deploy key; never commit)
+ssh-key
+sshconf

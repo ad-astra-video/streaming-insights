@@ -19,21 +19,21 @@ import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import type { MediaConfig } from "./config";
-import { WebRtcIngestSession } from "./rtc";
-import { WindowAccumulator, type CodecWindow, type IngestFrame } from "./windows";
+import type { MediaConfig } from "./config.js";
+import { WebRtcIngestSession } from "./rtc.js";
+import { WindowAccumulator, type CodecWindow, type IngestFrame } from "./windows.js";
 import {
   ControlClient,
   LocalControlClient,
   type EventPayload,
   type LedgerWindowPayload,
-} from "./control-client";
+} from "./control-client.js";
 import {
   HttpRunnerClient,
   MockRunnerClient,
   type MageRunnerClient,
   type WindowOutcome,
-} from "./runner-client";
+} from "./runner-client.js";
 import type { FastifyInstance } from "fastify";
 
 interface ActiveStream {
@@ -217,7 +217,7 @@ export class MediaServer {
       stream.sockets.add(socket);
       this.clearGrace(req.params.sid);
       this.clearNoClient(req.params.sid);
-      socket.on("message", (data) => {
+      socket.on("message", (data: any) => {
         void this.handleWsFrame(stream, data).catch((e) => console.error("[media] frame err", e));
       });
       const onClose = () => {
@@ -237,6 +237,18 @@ export class MediaServer {
     });
 
     app.get("/health", async () => {
+      const sessions = [...this.active.values()].map((s) => ({
+        sid: s.sid,
+        source: s.source,
+        windowsPosted: s.windowsPosted,
+        eventsPosted: s.eventsPosted,
+        closed: s.closed,
+      }));
+      return { status: "ok", activeSessions: sessions };
+    });
+
+    // Alias for the deploy health probe (compose hits /api/health).
+    app.get("/api/health", async () => {
       const sessions = [...this.active.values()].map((s) => ({
         sid: s.sid,
         source: s.source,

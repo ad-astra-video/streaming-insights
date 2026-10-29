@@ -1,5 +1,5 @@
-import { loadMediaConfig } from "./config";
-import { MediaServer } from "./server";
+import { loadMediaConfig } from "./config.js";
+import { MediaServer } from "./server.js";
 
 async function main() {
   const cfg = loadMediaConfig();

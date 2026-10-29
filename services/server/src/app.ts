@@ -1,193 +1,181 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
-import { asc, desc, eq } from "drizzle-orm";
-import type { Db } from "./db";
-import type { ServerConfig } from "./config";
-import {
-  createStreamSession,
-  endStreamSession,
-  getStreamSession,
-  getRunner,
-  heartbeatRunner,
-  listRunners,
-  registerRunner,
-  NoCapacityError,
-  CustomError,
-} from "./runners";
-import { persistPrompt } from "./prompts";
-import { recordWindow, listWindows, type RecordWindowInput } from "./ledger";
-import { tokenSummary } from "./token-summary";
-import { events, prompts, runners as runnersTable, streamSessions } from "./schema";
+import { asc, eq, gt } from "drizzle-orm";
+import { events, sessions, tokenLedger } from "@streaming-insights/db";
+import { ROUTES, streamWindowEventJsonSchema, CONTRACT_VERSION } from "@streaming-insights/shared";
+import type { Db } from "./db.js";
+import type { ServerConfig } from "./config.js";
+import { registerWriteRoutes } from "./write.js";
 
 export interface AppDeps {
   db: Db;
   cfg: ServerConfig;
 }
 
+/** Normalized per-window event read from the event store. */
+interface EventRow {
+  seq: number;
+  payload: Record<string, unknown>;
+}
+
+async function sessionExists(db: Db, sessionId: string): Promise<boolean> {
+  const rows = await db.select({ id: sessions.id }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+  return rows.length > 0;
+}
+
+async function listEvents(db: Db, sessionId: string): Promise<EventRow[]> {
+  const rows = await db
+    .select({ seq: events.seq, payload: events.payload })
+    .from(events)
+    .where(eq(events.sessionId, sessionId))
+    .orderBy(asc(events.seq));
+  return rows as EventRow[];
+}
+
+async function listEventsAfter(db: Db, sessionId: string, afterSeq: number): Promise<EventRow[]> {
+  const rows = await db
+    .select({ seq: events.seq, payload: events.payload })
+    .from(events)
+    .where(gt(events.seq, afterSeq))
+    .orderBy(asc(events.seq));
+  return rows as EventRow[];
+}
+
 /**
- * Build the control-plane Fastify app for the Mage-VL streaming showcase.
- * Scaffolded to mirror highlights.live `services/server` (`buildApp`): a bare
- * Fastify instance, CORS on, and routes that talk to the Drizzle `Db`. No auth
- * for this greenfield phase — the goal is to persist stream sessions, prompts,
- * and runner slots, and to expose runner health/capacity and a token summary.
+ * Build the control-plane Fastify app exposing the structured live data-out
+ * ("springboard") API. Reads per-window events and the token ledger from the
+ * Drizzle `Db` and serves them over SSE (live), NDJSON (batch), an aggregated
+ * token summary, and the versioned JSON Schema contract.
  */
 export function buildApp(deps: AppDeps): FastifyInstance {
   const { db, cfg } = deps;
   const app = Fastify({ logger: false });
   app.register(cors, { origin: true });
 
-  app.setErrorHandler((err: any, _req, reply) => {
-    if (err instanceof NoCapacityError) return reply.code(503).send({ error: err.message });
-    if (err instanceof CustomError) {
-      return reply.code(err.statusCode).send({ error: err.message });
-    }
-    app.log.error(err);
-    return reply.code(500).send({ error: "internal error" });
-  });
+  // Health — used by runners/ingress and on the deploy health probe.
+  app.get(ROUTES.health, async () => ({ status: "ok" }));
 
-  // --- Health ---
-  app.get("/health", async () => {
-    const runners = await db.select().from(runnersTable).orderBy(desc(runnersTable.gpuIndex));
-    const streams = await db.select().from(streamSessions);
-    return { status: "ok", runners, streamSessions: streams, maxStreams: cfg.maxStreams };
-  });
-
-  // --- Runners ---
-  app.post<{ Body: { name: string; gpuIndex: number; host: string; capacity?: number } }>(
-    "/runners",
-    async (req, reply) => {
-      const { name, gpuIndex, host, capacity } = req.body ?? {};
-      if (!name || typeof gpuIndex !== "number" || !host) {
-        return reply.code(422).send({ error: "name, gpuIndex and host are required" });
-      }
-      const runner = await registerRunner(db, cfg, { name, gpuIndex, host, capacity });
-      return reply.code(201).send(runner);
-    }
-  );
-
-  app.post<{ Params: { id: string }; Body: { slotsUsed?: number } }>(
-    "/runners/:id/heartbeat",
-    async (req, reply) => {
-      const runner = await heartbeatRunner(db, req.params.id, { slotsUsed: req.body?.slotsUsed });
-      if (!runner) return reply.code(404).send({ error: `Runner not found: ${req.params.id}` });
-      return runner;
-    }
-  );
-
-  app.get("/runners", async () => ({ runners: await listRunners(db, cfg) }));
-
-  // --- Stream sessions ---
-  app.post<{ Body: { source: string; runnerId?: string; sessionId?: string } }>(
-    "/stream-sessions",
-    async (req, reply) => {
-      const { source, runnerId, sessionId } = req.body ?? {};
-      if (!source) return reply.code(422).send({ error: "source is required" });
-      const { session, runner } = await createStreamSession(db, cfg, { source, runnerId, sessionId });
-      return reply.code(201).send({ session, runner });
-    }
-  );
-
-  app.post<{ Params: { id: string } }>("/stream-sessions/:id/end", async (req, reply) => {
-    const result = await endStreamSession(db, req.params.id);
-    if (!result) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
-    return result;
-  });
-
-  app.get<{ Params: { id: string } }>("/stream-sessions/:id", async (req, reply) => {
-    const session = await getStreamSession(db, req.params.id);
-    if (!session) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
-    const runner = session.runnerId ? await getRunner(db, session.runnerId) : null;
-    const [promptRow] = await db
-      .select()
-      .from(prompts)
-      .where(eq(prompts.streamSessionId, session.id))
-      .limit(1);
-    return { session, runner, prompt: promptRow ?? null };
-  });
-
-  // --- Prompts ---
-  app.post<{ Params: { id: string }; Body: { text: string } }>(
-    "/stream-sessions/:id/prompts",
-    async (req, reply) => {
-      const text = req.body?.text;
-      if (typeof text !== "string" || text.length === 0) {
-        return reply.code(422).send({ error: "text is required" });
-      }
-      const prompt = await persistPrompt(db, req.params.id, text);
-      return reply.code(201).send(prompt);
-    }
-  );
-
-  // --- Token ledger / windows ---
-  app.post<{ Params: { id: string }; Body: RecordWindowInput }>(
-    "/stream-sessions/:id/windows",
-    async (req, reply) => {
-      const b = req.body ?? {};
-      if (typeof b.seq !== "number" || typeof b.tStart !== "number" || typeof b.tEnd !== "number") {
-        return reply.code(422).send({ error: "seq, tStart and tEnd are required" });
-      }
-      const row = await recordWindow(db, req.params.id, b);
-      return reply.code(201).send(row);
-    }
-  );
-
-  app.get<{ Params: { id: string } }>("/stream-sessions/:id/windows", async (req, reply) => ({
-    windows: await listWindows(db, req.params.id),
+  // JSON Schema for the versioned v1 event contract.
+  app.get(ROUTES.schema, async () => ({
+    version: CONTRACT_VERSION,
+    schema: streamWindowEventJsonSchema,
   }));
 
-  app.get<{ Params: { id: string } }>("/stream-sessions/:id/token-summary", async (req, reply) => {
-    const session = await getStreamSession(db, req.params.id);
-    if (!session) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
-    const summary = await tokenSummary(db, req.params.id);
-    return { streamSessionId: req.params.id, ...summary };
+  // Runtime wiring for the browser: the public media origin to ingest against.
+  // Served from the COMMITTED compose env so the webapp never has to guess the
+  // docker-internal media hostname (or a build-time constant baked per box).
+  app.get(ROUTES.config, async () => ({
+    version: CONTRACT_VERSION,
+    mediaBaseUrl: cfg.mediaPublicBaseUrl ?? null,
+    controlBaseUrl: cfg.publicBaseUrl ?? null,
+  }));
+
+  // Live SSE feed: catch up on persisted events, then stream new ones as they
+  // are written to the event store.
+  app.get(ROUTES.sessionEvents(":sessionId"), async (req, reply) => {
+    const { sessionId } = req.params as { sessionId: string };
+    if (!(await sessionExists(db, sessionId))) {
+      return reply.code(404).send({ error: `Session not found: ${sessionId}` });
+    }
+
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const writeFrame = (seq: number, payload: unknown) => {
+      res.write(`id: ${seq}\n`);
+      res.write(`event: window\n`);
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    // Catch-up on already-persisted events.
+    let lastSeq = -1;
+    try {
+      for (const e of await listEvents(db, sessionId)) {
+        writeFrame(e.seq, e.payload);
+        lastSeq = e.seq;
+      }
+    } catch (err) {
+      // Log and continue polling; the SSE stream is best-effort.
+      req.log.error(err, "springboard SSE catch-up failed");
+    }
+
+    // Poll for newly-inserted events so the feed is live even though the
+    // runner/ingress process writes to the same DB.
+    const timer = setInterval(async () => {
+      try {
+        for (const e of await listEventsAfter(db, sessionId, lastSeq)) {
+          writeFrame(e.seq, e.payload);
+          lastSeq = e.seq;
+        }
+      } catch (err) {
+        req.log.error(err, "springboard SSE poll failed");
+      }
+    }, cfg.ssePollMs);
+
+    req.raw.on("close", () => clearInterval(timer));
   });
 
-  // --- Events (springboard data-out contract) ---
-  app.get<{ Params: { id: string } }>("/stream-sessions/:id/events", async (req, reply) => {
+  // NDJSON batch/offline feed: one event per line.
+  app.get(ROUTES.sessionEventsNdjson(":sessionId"), async (req, reply) => {
+    const { sessionId } = req.params as { sessionId: string };
+    if (!(await sessionExists(db, sessionId))) {
+      return reply.code(404).send({ error: `Session not found: ${sessionId}` });
+    }
+    const rows = await listEvents(db, sessionId);
+    const body = rows.map((r) => JSON.stringify(r.payload)).join("\n") + (rows.length ? "\n" : "");
+    return reply
+      .code(200)
+      .header("Content-Type", "application/x-ndjson")
+      .send(body);
+  });
+
+  // Aggregated per-session token summary (drives the token-savings dashboard).
+  app.get(ROUTES.sessionTokenSummary(":sessionId"), async (req, reply) => {
+    const { sessionId } = req.params as { sessionId: string };
+    if (!(await sessionExists(db, sessionId))) {
+      return reply.code(404).send({ error: `Session not found: ${sessionId}` });
+    }
     const rows = await db
       .select()
-      .from(events)
-      .where(eq(events.streamSessionId, req.params.id))
-      .orderBy(asc(events.seq));
-    return { events: rows };
+      .from(tokenLedger)
+      .where(eq(tokenLedger.sessionId, sessionId));
+
+    let silent = 0;
+    let speak = 0;
+    let visual = 0;
+    let dense = 0;
+    let generated = 0;
+    for (const r of rows) {
+      if (r.decision === "silent") silent += 1;
+      else if (r.decision === "speak") speak += 1;
+      visual += r.tokensVisual ?? 0;
+      dense += r.tokensBaselineDense ?? 0;
+      generated += r.decision === "silent" ? 0 : (r.tokensGenerated ?? 0);
+    }
+    const saved = Math.max(dense - visual, 0);
+    return {
+      sessionId,
+      windows: rows.length,
+      silentWindows: silent,
+      speakWindows: speak,
+      tokensVisualTotal: visual,
+      tokensBaselineDenseTotal: dense,
+      tokensGeneratedTotal: generated,
+      tokensSavedTotal: saved,
+      savedVsBaseline: dense > 0 ? Math.min(saved / dense, 1) : 0,
+    };
   });
 
-  // The media server POSTs each per-window event here after dispatch, so the
-  // springboard data-out feed (gate + tokens + text) is persisted alongside the
-  // token ledger. Mirrors the ledger write path: the stream session must exist.
-  app.post<{
-    Params: { id: string };
-    Body: {
-      seq: number;
-      tStart: number;
-      tEnd: number;
-      gate?: unknown;
-      tokens?: unknown;
-      prompt?: string;
-      event?: unknown;
-    };
-  }>("/stream-sessions/:id/events", async (req, reply) => {
-    const b = req.body ?? {};
-    if (typeof b.seq !== "number" || typeof b.tStart !== "number" || typeof b.tEnd !== "number") {
-      return reply.code(422).send({ error: "seq, tStart and tEnd are required" });
-    }
-    const session = await getStreamSession(db, req.params.id);
-    if (!session) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
-    const [row] = await db
-      .insert(events)
-      .values({
-        streamSessionId: req.params.id,
-        seq: b.seq,
-        tStart: b.tStart,
-        tEnd: b.tEnd,
-        gate: b.gate ?? null,
-        tokens: b.tokens ?? null,
-        prompt: b.prompt ?? null,
-        event: b.event ?? null,
-      })
-      .returning();
-    return reply.code(201).send(row);
-  });
+  // Media -> control WRITE path (Phase 7): reserve runner slots, persist
+  // windows/events/prompts. Shares the same sessions/tokenLedger/events tables
+  // as the springboard READ paths above, so data-out reflects media ingest.
+  registerWriteRoutes(app, db, cfg);
 
   return app;
 }
