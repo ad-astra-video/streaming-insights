@@ -15,6 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # RTC decode dependency. services/media shells out to ffmpeg for the
+      # one-shot decode of each sampled access unit, and the media e2e builds
+      # its H264 fixture with it. The ubuntu-latest image does not ship ffmpeg:
+      # without it every access unit decodes to zero frames (packets>0
+      # frames=0) and the e2e dies on `spawnSync ffmpeg ENOENT`. Same
+      # dependency the runtime Dockerfile installs.
+      - name: Install ffmpeg (RTC decode dependency)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+
       - uses: pnpm/action-setup@v4
         with:
           version: 12.5.1
