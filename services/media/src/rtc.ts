@@ -54,7 +54,9 @@ export interface RtcIngestOptions {
   iceServers?: { urls: string | string[]; username?: string; credential?: string }[];
   /** Max ms to wait for the answerer's ICE gathering to complete before
    *  returning the answer, so the answer carries a reachable candidate.
-   *  Default 2000. */
+   *  Default 5000 (a TURN allocation + STUN round trip on a slow box exceeds
+   *  the old 2000ms bound, which silently returned a host-only answer the
+   *  browser could never reach — ADAAAA-7582). */
   iceGatherTimeoutMs?: number;
 }
 
@@ -68,6 +70,31 @@ export interface DecodedFrame {
   /** Ingest latency (ms) from the last RTP packet received to this decoded
    *  JPEG being emitted — the RTC video-in decode leg of the live budget. */
   latencyMs?: number;
+}
+
+/** Count ICE candidates in an SDP by type (`host`/`srflx`/`prflx`/`relay`). */
+export function candidateTypes(sdp: string | undefined): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const line of (sdp || "").split(/\r?\n/)) {
+    if (!line.startsWith("a=candidate:")) continue;
+    const m = / typ (\w+)/.exec(line);
+    const type = m ? m[1] : "unknown";
+    counts[type] = (counts[type] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Candidate type of a single ICE candidate SDP line. */
+export function candidateTypeOf(candidate: string | undefined): string {
+  if (!candidate) return "end";
+  const m = / typ (\w+)/.exec(candidate);
+  return m ? m[1] : "unknown";
+}
+
+function describeCandidates(counts: Record<string, number>): string {
+  const keys = ["host", "srflx", "prflx", "relay"];
+  const parts = keys.filter((k) => counts[k]).map((k) => `${k}=${counts[k]}`);
+  return parts.length ? parts.join(" ") : "none";
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -175,6 +202,14 @@ export class WebRtcIngestSession extends EventEmitter {
   private lastPacketAt = 0;
   /** Number of audio (opus) RTP packets received. */
   audioPacketsReceived = 0;
+  /** Number of remote ICE candidates trickled in by the browser (diagnostics). */
+  remoteCandidates = 0;
+  /** Last observed RTCPeerConnection.connectionState (diagnostics). */
+  iceState = "new";
+  /** Candidate types in the last answer we returned (diagnostics). */
+  answerCandidates: Record<string, number> = {};
+  /** How long the bounded ICE gather wait took on the last offer (ms). */
+  gatherMs = 0;
   /** Active audio track (receives raw opus RTP for the audio ingest path). */
   private activeAudioTrack?: MediaStreamTrack;
   /** werift fragment buffer for fragmented audio packets. */
@@ -276,9 +311,15 @@ export class WebRtcIngestSession extends EventEmitter {
         }
       });
     });
-    // Surface disconnects so the media server can run its normal teardown
-    // (reconnect-grace -> release the perceive slot) when the peer drops.
+    // Surface the peer's lifecycle: a session that never leaves `checking`
+    // (no ICE pair, no DTLS) is the signature of an unreachable answer, and it
+    // used to be invisible except as `packets=0` at close (ADAAAA-7582).
     (pc.connectionState as any)?.subscribe?.((state: string) => {
+      if (state !== this.iceState) {
+        this.iceState = state;
+        // eslint-disable-next-line no-console
+        console.log(`[rtc] connectionState=${state} remoteCandidates=${this.remoteCandidates} packets=${this.packetsReceived}`);
+      }
       if (state === "closed" || state === "failed") this.emit("close");
     });
     await pc.setRemoteDescription(offer as any);
@@ -288,15 +329,33 @@ export class WebRtcIngestSession extends EventEmitter {
     // actually carries a reachable candidate. Returning before gathering puts
     // no candidate in the answer, so the browser never connects and falls into
     // the ~17s reconnect loop (ADAAAA-7304 finding 4).
+    const gatherStart = Date.now();
     await this.waitForIceGathering(pc);
-    return pc.localDescription as any;
+    this.gatherMs = Date.now() - gatherStart;
+    const local = (pc.localDescription as RTCSessionDescriptionInit) ?? answer;
+    this.answerCandidates = candidateTypes(local.sdp);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[rtc] answer cands ${describeCandidates(this.answerCandidates)} gatherMs=${this.gatherMs} ` +
+        `gatherState=${pc.iceGatheringState} remoteCandidates=${this.remoteCandidates}`
+    );
+    if (!this.answerCandidates.relay && !this.answerCandidates.srflx) {
+      // Host candidates are container-private: if gathering produced nothing
+      // public, the browser has no path and ICE can never complete.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[rtc] answer has NO relay/srflx candidate (gatherMs=${this.gatherMs} state=${pc.iceGatheringState}) — ` +
+          "check RTC_ICE_SERVERS TURN reachability from the media container; the browser cannot reach host candidates."
+      );
+    }
+    return local;
   }
 
   /** Wait (bounded) for the answerer's ICE gathering to complete so the answer
    *  carries a candidate. No-op when already complete. */
   private async waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
     if (pc.iceGatheringState === "complete") return;
-    const timeout = this.opts.iceGatherTimeoutMs ?? 2000;
+    const timeout = this.opts.iceGatherTimeoutMs ?? 5000;
     await Promise.race([
       new Promise<void>((resolve) => {
         const check = () => {
@@ -312,8 +371,15 @@ export class WebRtcIngestSession extends EventEmitter {
   /** Add a remote ICE candidate (trickle). */
   async addIceCandidate(candidate: any): Promise<void> {
     if (!this.pc || !candidate) return;
+    // Accept both `{ candidate: "<sdp line>", sdpMid, sdpMLineIndex }` and a
+    // bare candidate string, so a client that posts the raw line still works.
+    const init = typeof candidate === "string" ? { candidate } : candidate;
     try {
-      await this.pc.addIceCandidate(candidate);
+      await this.pc.addIceCandidate(init);
+      this.remoteCandidates++;
+      const type = candidateTypeOf(init.candidate);
+      // eslint-disable-next-line no-console
+      console.log(`[rtc] remote candidate typ=${type} n=${this.remoteCandidates}`);
     } catch {
       /* tolerate duplicates / late candidates */
     }
@@ -499,8 +565,25 @@ export class WebRtcIngestSession extends EventEmitter {
           resolve(null);
         }
       });
-      ff.stdin.write(segment);
-      ff.stdin.end(); // EOF -> ffmpeg flushes + emits, then closes
+      // ffmpeg may exit before consuming the whole segment (undecodable frame,
+      // codec mismatch, OOM-kill). Writing to a closed stdin then raises EPIPE
+      // on the socket; with no `error` listener that is an UNCAUGHT event and
+      // it takes the whole media process down (all live sessions with it).
+      // Guard both the stream error and the write itself.
+      ff.stdin.on("error", (e: NodeJS.ErrnoException) => {
+        if (e?.code !== "EPIPE") this.emit("ffmpeg", `stdin ${e?.code || e?.message || e}`);
+      });
+      try {
+        ff.stdin.write(segment);
+        ff.stdin.end(); // EOF -> ffmpeg flushes + emits, then closes
+      } catch (e: any) {
+        if (e?.code !== "EPIPE") this.emit("ffmpeg", `stdin write ${e?.code || e?.message || e}`);
+        try {
+          ff.stdin.destroy();
+        } catch {
+          /* already gone */
+        }
+      }
     });
 
     if (jpeg && jpeg.length > 2) {
@@ -524,6 +607,14 @@ export class WebRtcIngestSession extends EventEmitter {
       codecMime: this.codecMime,
       started: this.started,
       closed: this.closed,
+      // ICE diagnostics: `iceState` stuck at "checking" with
+      // `remoteCandidates=0` means the browser never trickled candidates;
+      // "checking" with candidates but no packets means the media path (TURN
+      // relay) is blocked (ADAAAA-7582).
+      iceState: this.iceState,
+      remoteCandidates: this.remoteCandidates,
+      answerCandidates: this.answerCandidates,
+      gatherMs: this.gatherMs,
     };
   }
 

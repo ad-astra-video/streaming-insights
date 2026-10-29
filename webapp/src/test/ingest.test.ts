@@ -22,23 +22,44 @@ const mediaStream = {
 
 class FakePc {
   static mode: "connect" | "stall" = "connect";
+  /** ICE candidates the fake browser "gathers" during setLocalDescription, and
+   *  one late candidate emitted after the remote description is applied. */
+  static gathered: string[] = [];
   connectionState = "new";
+  iceGatheringState = "complete";
   closed = false;
-  private listeners: (() => void)[] = [];
+  private listeners = new Map<string, Set<(e: any) => void>>();
   constructor(public args: any) {}
   addTrack() {}
-  addEventListener(_: string, fn: () => void) {
-    this.listeners.push(fn);
+  addEventListener(ev: string, fn: (e: any) => void) {
+    if (!this.listeners.has(ev)) this.listeners.set(ev, new Set());
+    this.listeners.get(ev)!.add(fn);
   }
-  removeEventListener() {}
+  removeEventListener(ev: string, fn: (e: any) => void) {
+    this.listeners.get(ev)?.delete(fn);
+  }
+  private emit(ev: string, event: any) {
+    for (const fn of this.listeners.get(ev) ?? []) fn(event);
+  }
+  private candidateEvent(candidate: string | null) {
+    return {
+      candidate: candidate === null ? null : { candidate, sdpMid: "0", sdpMLineIndex: 0 },
+    };
+  }
   async createOffer() {
     return { type: "offer", sdp: "v=0" };
   }
-  async setLocalDescription() {}
+  async setLocalDescription() {
+    for (const c of FakePc.gathered) this.emit("icecandidate", this.candidateEvent(c));
+  }
+  localDescription = { type: "offer", sdp: "v=0" };
   async setRemoteDescription() {
     if (FakePc.mode === "connect") {
       this.connectionState = "connected";
-      setTimeout(() => this.listeners.forEach((f) => f()), 0);
+      // A candidate that arrives after the answer: it must be posted directly,
+      // not buffered forever.
+      this.emit("icecandidate", this.candidateEvent("candidate:9 1 udp 1 136.33.135.223 49175 typ relay"));
+      setTimeout(() => this.emit("connectionstatechange", {}), 0);
     }
   }
   close() {
@@ -74,6 +95,7 @@ describe("startIngest", () => {
   beforeEach(() => {
     calls = [];
     FakePc.mode = "connect";
+    FakePc.gathered = [];
     FakeWebSocket.instances = [];
     (globalThis as any).RTCPeerConnection = FakePc;
     (globalThis as any).WebSocket = FakeWebSocket;
@@ -155,6 +177,37 @@ describe("startIngest", () => {
     await new Promise((r) => setTimeout(r, 10));
     const sent = FakeWebSocket.instances[0].sent[0];
     expect(sent.timestamp).toBeGreaterThan(1_000_000_000);
+    await session.close();
+  });
+
+  it("trickles gathered ICE candidates to the media server (relay path)", async () => {
+    FakePc.gathered = [
+      "candidate:1 1 udp 2116026367 172.18.0.1 55904 typ host generation 0",
+      "candidate:2 1 udp 1679818751 74.80.181.58 55904 typ srflx raddr 0.0.0.0 rport 0",
+    ];
+    const { startIngest } = await import("../lib/ingest");
+    const seen: string[] = [];
+    const session = await startIngest({
+      stream: mediaStream,
+      mediaBaseUrl: "https://mage-media.example",
+      onIceCandidate: (dir, type) => seen.push(`${dir}:${type}`),
+    });
+    expect(session.transport).toBe("webrtc");
+    // Every gathered candidate (incl. the late relay one) is posted to the
+    // answerer's trickle route, addressed by the pcId from the answer.
+    const trickled = calls.filter((c) => c.url.includes("/rtc/ice/"));
+    expect(trickled.length).toBe(3);
+    for (const c of trickled) {
+      expect(c.url).toBe("https://mage-media.example/sessions/sid-1/rtc/ice/pc-1");
+      expect(c.method).toBe("POST");
+      expect(typeof c.body.candidate.candidate).toBe("string");
+    }
+    // Order is not meaningful (buffered candidates flush right after the
+    // answer; a candidate gathered during setRemoteDescription goes direct).
+    expect(
+      trickled.map((c) => (c.body.candidate.candidate.match(/ typ (\w+)/) ?? [])[1]).sort()
+    ).toEqual(["host", "relay", "srflx"]);
+    expect(seen).toEqual(["local:host", "local:srflx", "local:relay"]);
     await session.close();
   });
 

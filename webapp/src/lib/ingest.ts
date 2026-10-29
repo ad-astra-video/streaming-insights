@@ -46,6 +46,13 @@ export interface StartIngestOptions {
   sampleFps?: number;
   /** How long to wait for ICE to connect before falling back to `ws`. */
   rtcConnectTimeoutMs?: number;
+  /** How long to wait for the browser's own ICE gathering before sending the
+   *  offer (bounded). Candidates gathered later are trickled separately.
+   *  Default 2000ms. */
+  rtcGatherTimeoutMs?: number;
+  /** Observability hook: receives each local ICE candidate type gathered and
+   *  each candidate trickled to the media server (diagnostics only). */
+  onIceCandidate?: (dir: "local" | "remote", type: string, raw?: string) => void;
   onStatus?: (status: IngestStatus) => void;
 }
 
@@ -59,56 +66,121 @@ export interface ProvisionResponse {
 }
 
 const DEFAULT_RTC_CONNECT_TIMEOUT_MS = 6000;
+/** Bounded wait for the browser's own ICE gathering before the offer is sent.
+ *  Sending the offer first and relying on the answerer to learn our candidates
+ *  from inbound STUN checks does NOT work behind NAT: the media server only
+ *  creates a TURN permission for our address when it sends to it, so without
+ *  our candidates its relay-backed answer is unreachable and ICE never leaves
+ *  `checking` (ADAAAA-7582: `packets=0` + WSS fallback). */
+const DEFAULT_RTC_GATHER_TIMEOUT_MS = 2000;
 
 function normalizeBase(base: string): string {
   return base.trim().replace(/\/+$/, "");
 }
 
-async function provision(
-  mediaBaseUrl: string,
-  prompt: string | null
-): Promise<{ sid: string; body: ProvisionResponse }> {
-  const res = await fetch(`${normalizeBase(mediaBaseUrl)}/sessions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ source: "webrtc", prompt: prompt ?? undefined }),
+/** ICE candidate type ("host" | "srflx" | "prflx" | "relay"). */
+export function candidateType(candidate: string | undefined | null): string {
+  if (!candidate) return "end";
+  const m = / typ (\w+)/.exec(candidate);
+  return m ? m[1] : "unknown";
+}
+
+/** Resolve once gathering completes or `timeoutMs` elapses. */
+function waitForGather(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      pc.removeEventListener("icegatheringstatechange", onState);
+      resolve();
+    };
+    const onState = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    pc.addEventListener("icegatheringstatechange", onState);
+    onState();
   });
-  const body = (await res.json().catch(() => ({}))) as ProvisionResponse;
-  const sid = body.sessionId ?? body.streamSessionId;
-  if (!res.ok || !sid) {
-    throw new Error(body.error || `media session provision failed (${res.status})`);
-  }
-  return { sid, body };
 }
 
 /** Negotiate the WebRTC send-only rail. Resolves once ICE connects, rejects on
- *  timeout/negotiation failure so the caller can fall back to `ws`. */
+ *  timeout/negotiation failure so the caller can fall back to `ws`.
+ *
+ *  Candidates are trickled to the media server on `/sessions/:sid/rtc/ice/:pcId`
+ *  (the answerer cannot connect to a NAT'd browser without them). Candidates
+ *  gathered before the answer arrives carry no pcId yet, so they are buffered
+ *  and flushed once the answer names the peer connection. */
 async function negotiateRtc(
   mediaBaseUrl: string,
   sid: string,
   stream: MediaStream,
   iceServers: ProvisionResponse["iceServers"],
-  timeoutMs: number
+  timeoutMs: number,
+  gatherTimeoutMs = DEFAULT_RTC_GATHER_TIMEOUT_MS,
+  onIceCandidate?: StartIngestOptions["onIceCandidate"]
 ): Promise<RTCPeerConnection> {
   const pc = new RTCPeerConnection({
     ...(iceServers?.length ? { iceServers } : {}),
   });
   for (const track of stream.getVideoTracks()) pc.addTrack(track, stream);
 
+  let pcId: string | null = null;
+  const buffered: RTCIceCandidateInit[] = [];
+  const postCandidate = (candidate: RTCIceCandidateInit) => {
+    void fetch(`${normalizeBase(mediaBaseUrl)}/sessions/${sid}/rtc/ice/${encodeURIComponent(pcId as string)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        candidate: {
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid ?? null,
+          sdpMLineIndex: candidate.sdpMLineIndex ?? null,
+        },
+      }),
+    }).catch(() => {
+      /* a dropped candidate only costs a retry on the other side */
+    });
+  };
+  pc.addEventListener("icecandidate", (e) => {
+    if (!e.candidate) return; // end-of-candidates
+    const type = candidateType(e.candidate.candidate);
+    onIceCandidate?.("local", type, e.candidate.candidate);
+    const init: RTCIceCandidateInit = {
+      candidate: e.candidate.candidate,
+      sdpMid: e.candidate.sdpMid ?? null,
+      sdpMLineIndex: e.candidate.sdpMLineIndex ?? null,
+    };
+    if (pcId) postCandidate(init);
+    else buffered.push(init);
+  });
+
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
+  // Give gathering a bounded head start so the offer SDP itself carries
+  // candidates when the browser is quick; later ones are trickled below.
+  await waitForGather(pc, gatherTimeoutMs);
 
+  const local = pc.localDescription ?? offer;
   const res = await fetch(`${normalizeBase(mediaBaseUrl)}/sessions/${sid}/rtc/offer`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ offer: { type: offer.type, sdp: offer.sdp } }),
+    body: JSON.stringify({ offer: { type: local.type, sdp: local.sdp } }),
   });
-  const body = (await res.json().catch(() => ({}))) as { answer?: RTCSessionDescriptionInit; error?: string };
+  const body = (await res.json().catch(() => ({}))) as {
+    answer?: RTCSessionDescriptionInit;
+    pcId?: string;
+    error?: string;
+  };
   if (!res.ok || !body.answer) {
     pc.close();
     throw new Error(body.error || `rtc offer rejected (${res.status})`);
   }
+  pcId = body.pcId ?? "0";
   await pc.setRemoteDescription(body.answer);
+  for (const candidate of buffered.splice(0)) postCandidate(candidate);
 
   await new Promise<void>((resolve, reject) => {
     if (pc.connectionState === "connected") return resolve();
@@ -136,6 +208,23 @@ async function negotiateRtc(
   });
 
   return pc;
+}
+
+async function provision(
+  mediaBaseUrl: string,
+  prompt: string | null
+): Promise<{ sid: string; body: ProvisionResponse }> {
+  const res = await fetch(`${normalizeBase(mediaBaseUrl)}/sessions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ source: "webrtc", prompt: prompt ?? undefined }),
+  });
+  const body = (await res.json().catch(() => ({}))) as ProvisionResponse;
+  const sid = body.sessionId ?? body.streamSessionId;
+  if (!res.ok || !sid) {
+    throw new Error(body.error || `media session provision failed (${res.status})`);
+  }
+  return { sid, body };
 }
 
 /** Sample a video element onto a canvas and push JPEG frames over the ws rail. */
@@ -213,7 +302,9 @@ export async function startIngest(opts: StartIngestOptions): Promise<IngestSessi
         sid,
         opts.stream,
         body.iceServers,
-        opts.rtcConnectTimeoutMs ?? DEFAULT_RTC_CONNECT_TIMEOUT_MS
+        opts.rtcConnectTimeoutMs ?? DEFAULT_RTC_CONNECT_TIMEOUT_MS,
+        opts.rtcGatherTimeoutMs ?? DEFAULT_RTC_GATHER_TIMEOUT_MS,
+        opts.onIceCandidate
       );
       transport = "webrtc";
     } catch (e) {
