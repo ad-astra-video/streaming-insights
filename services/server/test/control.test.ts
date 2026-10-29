@@ -6,7 +6,7 @@ import { migrate } from "drizzle-orm/pglite/migrator";
 import { openPgliteDb, type Db } from "../src/db";
 import { buildApp } from "../src/app";
 import type { ServerConfig } from "../src/config";
-import { sessions } from "@streaming-insights/db";
+import { runners, sessions } from "@streaming-insights/db";
 
 const MIGRATIONS_DIR = fileURLToPath(new URL("../../../packages/db/drizzle", import.meta.url));
 
@@ -36,6 +36,13 @@ afterAll(async () => {
 });
 
 describe("control server write path (media -> control ingest)", () => {
+  it("seeds runner capacity on a clean deploy so the first session can reserve", async () => {
+    const rows = await db.select().from(runners);
+    expect(rows.length).toBe(cfg.runners);
+    expect(rows.every((r) => r.freeSlots === cfg.streamsPerRunner)).toBe(true);
+    expect(rows.every((r) => r.healthy)).toBe(true);
+  });
+
   it("registers a runner", async () => {
     const res = await app.inject({
       method: "POST",
@@ -131,5 +138,35 @@ describe("control server write path (media -> control ingest)", () => {
     const fake = "00000000-0000-0000-0000-000000000000";
     const p = await app.inject({ method: "POST", url: `/stream-sessions/${fake}/prompts`, payload: { text: "hi" } });
     expect(p.statusCode).toBe(404);
+  });
+
+  it("hard-stops an unpinned reserve when no runner has a free slot", async () => {
+    await db.update(runners).set({ freeSlots: 0 });
+    const before = (await db.select().from(sessions)).length;
+    const res = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    expect(res.statusCode).toBe(503);
+    // No capacity-less session may be created (`runner_id` null leaked slots
+    // because /end had nothing to release).
+    expect((await db.select().from(sessions)).length).toBe(before);
+  });
+
+  it("returns 404 for a pinned reserve on an unknown runner", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/stream-sessions",
+      payload: { source: "webrtc", runnerId: "00000000-0000-0000-0000-000000000000" },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it("reap reclaims slots leaked on a runner that never sent a heartbeat", async () => {
+    const [row] = await db.select().from(runners).limit(1);
+    expect(row.lastHeartbeat).toBeNull();
+    await db.update(runners).set({ freeSlots: 0 }).where(eq(runners.id, row.id));
+    const res = await app.inject({ method: "POST", url: "/runners/reap" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().reclaimed).toBeGreaterThanOrEqual(1);
+    const [after] = await db.select().from(runners).where(eq(runners.id, row.id));
+    expect(after.freeSlots).toBe(after.totalSlots);
   });
 });

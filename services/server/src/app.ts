@@ -5,7 +5,7 @@ import { events, sessions, tokenLedger } from "@streaming-insights/db";
 import { ROUTES, streamWindowEventJsonSchema, CONTRACT_VERSION } from "@streaming-insights/shared";
 import type { Db } from "./db.js";
 import type { ServerConfig } from "./config.js";
-import { registerWriteRoutes } from "./write.js";
+import { registerWriteRoutes, seedRunners } from "./write.js";
 
 export interface AppDeps {
   db: Db;
@@ -170,6 +170,13 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       tokensSavedTotal: saved,
       savedVsBaseline: dense > 0 ? Math.min(saved / dense, 1) : 0,
     };
+  });
+
+  // A clean deploy has no runner rows; seed the configured GPUs so capacity
+  // exists before the first browser session reserves a slot.
+  app.addHook("onReady", async () => {
+    const seeded = await seedRunners(db, cfg);
+    if (seeded > 0) app.log.info(`seeded ${seeded} runner(s) at ${cfg.streamsPerRunner} slots each`);
   });
 
   // Media -> control WRITE path (Phase 7): reserve runner slots, persist

@@ -5,7 +5,7 @@
 // control server. This module registers those write routes against the deploy
 // tree's `packages/db` schema so the springboard READ path (SSE / NDJSON /
 // token-summary in app.ts) and the media WRITE path share the same tables.
-import { and, asc, desc, eq, lte } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lte } from "drizzle-orm";
 import { events, prompts, runners, sessions, tokenLedger } from "@streaming-insights/db";
 import type { FastifyInstance } from "fastify";
 import type { Db } from "./db.js";
@@ -35,6 +35,25 @@ interface ReservedResult {
  *   GET  /runners                                -> list
  *   POST /runners                                { gpu, capacity? } -> register (test bootstrap)
  */
+/** Seed `cfg.runners` GPU runners when the table is empty.
+ *
+ *  A clean deploy starts with no runner rows, and until one exists every
+ *  `POST /stream-sessions` fails the capacity check — the stack looks healthy
+ *  while no browser can start a stream. Seeding here makes the committed compose
+ *  self-sufficient instead of depending on a manual `POST /runners` bootstrap on
+ *  the box. Idempotent: nothing is inserted once a runner row exists. */
+export async function seedRunners(db: Db, cfg: ServerConfig): Promise<number> {
+  const existing = await db.select().from(runners).limit(1);
+  if (existing.length > 0) return 0;
+  const capacity = Math.max(1, cfg.streamsPerRunner);
+  for (let gpu = 0; gpu < Math.max(1, cfg.runners); gpu += 1) {
+    await db
+      .insert(runners)
+      .values({ gpu, totalSlots: capacity, freeSlots: capacity, healthy: true });
+  }
+  return Math.max(1, cfg.runners);
+}
+
 export function registerWriteRoutes(
   app: FastifyInstance,
   db: Db,
@@ -89,6 +108,7 @@ export function registerWriteRoutes(
       let runner;
       if (req.body?.runnerId) {
         const [r] = await db.select().from(runners).where(eq(runners.id, req.body.runnerId)).limit(1);
+        if (!r) return reply.code(404).send({ error: `Runner not found: ${req.body.runnerId}` });
         runner = r;
       } else {
         const candidates = await db
@@ -99,15 +119,23 @@ export function registerWriteRoutes(
         runner = candidates.find((r) => r.freeSlots > 0);
       }
 
-      if (runner && runner.freeSlots <= 0) {
+      // Capacity is a HARD limit: a session must own a slot on a healthy runner.
+      // The unpinned path used to fall through with `runner === undefined` and
+      // still create a capacity-less session (`runner_id` null), which both
+      // bypassed MAX_STREAMS and leaked slots (nothing to release on /end).
+      if (!runner) {
         return reply.code(503).send({ error: "No runner capacity available" });
       }
-      if (runner) {
-        await db
-          .update(runners)
-          .set({ freeSlots: runner.freeSlots - 1 })
-          .where(eq(runners.id, runner.id));
+      if (!runner.healthy) {
+        return reply.code(503).send({ error: `Runner ${runner.id} is not healthy` });
       }
+      if (runner.freeSlots <= 0) {
+        return reply.code(503).send({ error: "No runner capacity available" });
+      }
+      await db
+        .update(runners)
+        .set({ freeSlots: runner.freeSlots - 1 })
+        .where(eq(runners.id, runner.id));
 
       const [session] = await db
         .insert(sessions)
@@ -313,6 +341,20 @@ export function registerWriteRoutes(
       await db.update(runners).set({ healthy: false, freeSlots: r.totalSlots }).where(eq(runners.id, r.id));
       released += 1;
     }
-    return { released };
+    // A runner that never sent a heartbeat (lastHeartbeat null) can never match
+    // `lte(lastHeartbeat, cutoff)`, so slots leaked by sessions that died before
+    // releasing them were unrecoverable. Reset those too: nothing is pinned to a
+    // heartbeat-less runner that still owns capacity.
+    const never = await db
+      .select()
+      .from(runners)
+      .where(and(eq(runners.healthy, true), isNull(runners.lastHeartbeat)));
+    let reclaimed = 0;
+    for (const r of never) {
+      if (r.freeSlots === r.totalSlots) continue;
+      await db.update(runners).set({ freeSlots: r.totalSlots }).where(eq(runners.id, r.id));
+      reclaimed += 1;
+    }
+    return { released, reclaimed };
   });
 }

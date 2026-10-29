@@ -45,7 +45,6 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
   let ctrlBase: string;
   let media: FastifyInstance;
   let mediaBase: string;
-  let runnerId: string;
   const fake = new FakeRunner();
 
   beforeAll(async () => {
@@ -65,14 +64,8 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
     await ctrl.listen({ port: 0, host: "127.0.0.1" });
     ctrlBase = `http://127.0.0.1:${(ctrl.server.address() as any).port}`;
 
-    // Register a runner so /stream-sessions has capacity to reserve against.
-    const rr = await ctrl.inject({
-      method: "POST",
-      url: "/runners",
-      // Deploy-tree runner contract (packages/db runners table).
-      payload: { gpu: 0, capacity: 3 },
-    });
-    runnerId = rr.json().id;
+    // The control server seeds `cfg.runners` runners at boot (clean-deploy
+    // behaviour), so /stream-sessions already has capacity to reserve against.
 
     // Media server pointed at the real control server, high sample cadence so
     // a fast RTC test still closes several windows.
@@ -137,6 +130,7 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
     expect(provBody.rtc).toBe(true);
     // dispatches a runner that reports slot usage
     expect(provBody.runner.slotsUsed).toBe(1);
+    const reservedRunnerId: string = provBody.runner.id;
 
     // 2) generate a small real H264 clip and stream it over RTP.
     const h264Path = path.join(tmpdir(), `si-e2e-${process.pid}.h264`);
@@ -234,15 +228,15 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
 
     // 4) runner reports slot usage: reservation recorded on the control runner.
     const runners = (await ctrl.inject({ method: "GET", url: "/runners" })).json();
-    expect(runners.runners.some((r: any) => r.id === runnerId && r.slotsUsed === 1)).toBe(true);
+    expect(runners.runners.some((r: any) => r.id === reservedRunnerId && r.slotsUsed === 1)).toBe(true);
 
     // 5) close -> reset the slot; the runner reports usage back to 0.
     const close = await media.inject({ method: "POST", url: `/sessions/${sid}/close` });
     expect(close.statusCode).toBe(200);
     const runnersAfter = await poll(
       async () => (await ctrl.inject({ method: "GET", url: "/runners" })).json(),
-      (b: any) => b.runners.find((r: any) => r.id === runnerId)?.slotsUsed === 0
+      (b: any) => b.runners.find((r: any) => r.id === reservedRunnerId)?.slotsUsed === 0
     );
-    expect(runnersAfter.runners.find((r: any) => r.id === runnerId).slotsUsed).toBe(0);
+    expect(runnersAfter.runners.find((r: any) => r.id === reservedRunnerId).slotsUsed).toBe(0);
   });
 });
