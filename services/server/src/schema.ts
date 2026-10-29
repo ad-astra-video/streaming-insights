@@ -150,3 +150,11 @@ export const schema = {
   tokenLedger,
   events,
 };
+
+// Inferred row types for the schema-typed services.
+export type Runner = typeof runners.$inferSelect;
+export type Session = typeof sessions.$inferSelect;
+export type StreamSession = typeof streamSessions.$inferSelect;
+export type Prompt = typeof prompts.$inferSelect;
+export type TokenLedgerRow = typeof tokenLedger.$inferSelect;
+export type Event = typeof events.$inferSelect;

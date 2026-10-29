@@ -157,12 +157,14 @@ export async function createStreamSession(
       })
       .returning();
 
-    await tx
+    const [updatedRunner] = await tx
       .update(runners)
       .set({ slotsUsed: runner.slotsUsed + 1, updatedAt: now() })
-      .where(eq(runners.id, runner.id));
+      .where(eq(runners.id, runner.id))
+      .returning();
 
-    return { session, runner };
+    if (!updatedRunner) throw new NoCapacityError();
+    return { session, runner: updatedRunner };
   });
 }
 
