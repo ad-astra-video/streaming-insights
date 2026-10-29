@@ -3,3 +3,11 @@ packages:
   - "services/server"
   - "services/media"
   - "webapp"
+
+# pnpm 12 blocks native build (postinstall) scripts by default and fails the
+# install with ERR_PNPM_IGNORED_BUILDS. esbuild ships a platform-specific
+# install script needed by vite/tsx/vitest (the media+webapp toolchain), so we
+# approve it here in the COMMITTED workspace file (not box-local) so the
+# Dockerfile's `pnpm install && pnpm -r build` succeeds cleanly.
+allowBuilds:
+  esbuild: true

@@ -7,19 +7,21 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"media: no tests\"",
+    "test": "vitest run",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
-    "@fastify/cors": "^10.0.1",
+    "@fastify/cors": "^11.3.1",
+    "@fastify/websocket": "^11.0.2",
     "@streaming-insights/shared": "workspace:*",
-    "fastify": "^5.1.0",
-    "werift": "^0.14.0"
+    "fastify": "^5.12.7",
+    "werift": "^0.24.4"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
   }
 }

@@ -12,3 +12,7 @@ data/
 coverage/
 .idea/
 .vscode/
+
+# local git plumbing (deploy key; never commit)
+ssh-key
+sshconf

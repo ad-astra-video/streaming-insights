@@ -1,9 +1,10 @@
 # streaming-insights — lightweight control/service image.
 #
-# Builds the pnpm workspace (packages/* + services/*) and runs the control
-# server. The media service is started from the same image with a different
-# command. The Mage-VL SGLang runner lives in Dockerfile.runner (a separate,
-# heavy GPU image) — see the runner image below.
+# Builds the pnpm workspace (packages/* + services/* + webapp) and runs the
+# control server, which also serves the built webapp bundle (webapp/dist) at /.
+# The media service is started from the same image with a different command.
+# The Mage-VL SGLang runner lives in Dockerfile.runner (a separate, heavy GPU
+# image) — see the runner image below.
 #
 # Build:
 #   docker build -t streaming-insights:control .
@@ -15,9 +16,10 @@
 FROM node:24-slim AS build
 RUN corepack enable
 WORKDIR /repo
-COPY package.json pnpm-workspace.yaml .npmrc ./
+COPY package.json pnpm-workspace.yaml .npmrc tsconfig.base.json ./
 COPY packages ./packages
 COPY services ./services
+COPY webapp ./webapp
 RUN pnpm install --frozen-lockfile=false && pnpm -r build
 
 FROM node:24-slim
@@ -26,5 +28,6 @@ WORKDIR /repo
 COPY --from=build /repo/node_modules ./node_modules
 COPY --from=build /repo/packages ./packages
 COPY --from=build /repo/services ./services
+COPY --from=build /repo/webapp ./webapp
 EXPOSE 3100 4070
 CMD ["node", "services/server/dist/index.js"]

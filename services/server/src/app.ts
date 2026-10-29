@@ -5,6 +5,7 @@ import { events, sessions, tokenLedger } from "@streaming-insights/db";
 import { ROUTES, streamWindowEventJsonSchema, CONTRACT_VERSION } from "@streaming-insights/shared";
 import type { Db } from "./db.js";
 import type { ServerConfig } from "./config.js";
+import { registerWriteRoutes } from "./write.js";
 
 export interface AppDeps {
   db: Db;
@@ -161,6 +162,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       savedVsBaseline: dense > 0 ? Math.min(saved / dense, 1) : 0,
     };
   });
+
+  // Media -> control WRITE path (Phase 7): reserve runner slots, persist
+  // windows/events/prompts. Shares the same sessions/tokenLedger/events tables
+  // as the springboard READ paths above, so data-out reflects media ingest.
+  registerWriteRoutes(app, db, cfg);
 
   return app;
 }
