@@ -5,7 +5,7 @@
 // control server. This module registers those write routes against the deploy
 // tree's `packages/db` schema so the springboard READ path (SSE / NDJSON /
 // token-summary in app.ts) and the media WRITE path share the same tables.
-import { and, asc, desc, eq, isNull, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNull, lte } from "drizzle-orm";
 import { events, prompts, runners, sessions, tokenLedger } from "@streaming-insights/db";
 import type { FastifyInstance } from "fastify";
 import type { Db } from "./db.js";
@@ -54,11 +54,100 @@ export async function seedRunners(db: Db, cfg: ServerConfig): Promise<number> {
   return Math.max(1, cfg.runners);
 }
 
+/** Cutoff before which a session counts as dead (no window activity). */
+function sessionCutoff(cfg: ServerConfig): Date {
+  return new Date(Date.now() - cfg.sessionTtlMs);
+}
+
+/**
+ * Sessions that still own a runner slot.
+ *
+ * A session is live while it was started recently or has produced a window
+ * event within `cfg.sessionTtlMs`: the media server writes one event per closed
+ * window, so silence means the ingest is gone (tab closed, media container
+ * restarted) even though `/end` was never called.
+ *
+ * Slot capacity is DERIVED from this set, never trusted from the mutable
+ * `runners.freeSlots` counter: a leaked counter permanently starved the pool
+ * (three orphaned sessions => every new browser ingest 503'd on a healthy
+ * stack).
+ */
+async function liveSessionRows(
+  db: Db,
+  cfg: ServerConfig
+): Promise<Array<{ id: string; runnerId: string | null }>> {
+  const cutoff = sessionCutoff(cfg);
+  const open = await db
+    .select({ id: sessions.id, runnerId: sessions.runnerId, startedAt: sessions.startedAt })
+    .from(sessions)
+    .where(isNull(sessions.endedAt));
+  const live: Array<{ id: string; runnerId: string | null }> = [];
+  for (const s of open) {
+    if (s.startedAt.getTime() > cutoff.getTime()) {
+      live.push({ id: s.id, runnerId: s.runnerId });
+      continue;
+    }
+    const [recent] = await db
+      .select({ ts: events.ts })
+      .from(events)
+      .where(and(eq(events.sessionId, s.id), gte(events.ts, cutoff)))
+      .limit(1);
+    if (recent) live.push({ id: s.id, runnerId: s.runnerId });
+  }
+  return live;
+}
+
+/** Slots held per runner id, derived from the live set. */
+function usedSlots(live: Array<{ id: string; runnerId: string | null }>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const s of live) {
+    if (!s.runnerId) continue;
+    counts.set(s.runnerId, (counts.get(s.runnerId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * End orphaned sessions and reconcile every runner's `freeSlots` with the live
+ * set. Safe to call at boot (a fresh control process owns no live media
+ * sessions from a previous container generation) and from a timer.
+ */
+export async function reclaimRunnerSlots(
+  db: Db,
+  cfg: ServerConfig
+): Promise<{ ended: number; runners: number }> {
+  const live = await liveSessionRows(db, cfg);
+  const liveIds = new Set(live.map((s) => s.id));
+  const open = await db.select({ id: sessions.id }).from(sessions).where(isNull(sessions.endedAt));
+  let ended = 0;
+  for (const s of open) {
+    if (liveIds.has(s.id)) continue;
+    await db
+      .update(sessions)
+      .set({ status: "ended", endedAt: new Date() })
+      .where(eq(sessions.id, s.id));
+    ended += 1;
+  }
+  const counts = usedSlots(live);
+  const rows = await db.select().from(runners);
+  let runnersReconciled = 0;
+  for (const r of rows) {
+    const free = Math.max(r.totalSlots - (counts.get(r.id) ?? 0), 0);
+    if (free === r.freeSlots) continue;
+    await db.update(runners).set({ freeSlots: free }).where(eq(runners.id, r.id));
+    runnersReconciled += 1;
+  }
+  return { ended, runners: runnersReconciled };
+}
+
 export function registerWriteRoutes(
   app: FastifyInstance,
   db: Db,
   cfg: ServerConfig
 ): void {
+  /** Reclaim orphaned sessions + reconcile slot counters for this deploy. */
+  const reclaim = () => reclaimRunnerSlots(db, cfg);
+
   // --- Runners ---
   app.get("/runners", async () => {
     // Expose occupied slots alongside free/total, mirroring the reservation
@@ -104,6 +193,14 @@ export function registerWriteRoutes(
     async (req, reply) => {
       const source = req.body?.source ?? "webrtc";
 
+      // Capacity is derived from the live session set, never from the mutable
+      // `freeSlots` counter (see liveSessionRows): a leaked counter used to
+      // starve a healthy pool permanently.
+      const live = await liveSessionRows(db, cfg);
+      const used = usedSlots(live);
+      const freeFor = (r: { id: string; totalSlots: number }) =>
+        Math.max(r.totalSlots - (used.get(r.id) ?? 0), 0);
+
       // Prefer the requested runner, else the first with a free slot.
       let runner;
       if (req.body?.runnerId) {
@@ -116,7 +213,7 @@ export function registerWriteRoutes(
           .from(runners)
           .where(eq(runners.healthy, true))
           .orderBy(desc(runners.freeSlots));
-        runner = candidates.find((r) => r.freeSlots > 0);
+        runner = candidates.find((r) => freeFor(r) > 0);
       }
 
       // Capacity is a HARD limit: a session must own a slot on a healthy runner.
@@ -129,12 +226,13 @@ export function registerWriteRoutes(
       if (!runner.healthy) {
         return reply.code(503).send({ error: `Runner ${runner.id} is not healthy` });
       }
-      if (runner.freeSlots <= 0) {
+      const free = freeFor(runner);
+      if (free <= 0) {
         return reply.code(503).send({ error: "No runner capacity available" });
       }
       await db
         .update(runners)
-        .set({ freeSlots: runner.freeSlots - 1 })
+        .set({ freeSlots: free - 1 })
         .where(eq(runners.id, runner.id));
 
       const [session] = await db
@@ -148,7 +246,7 @@ export function registerWriteRoutes(
           ? {
               id: runner.id,
               status: runner.healthy ? "healthy" : "down",
-              slotsUsed: runner.totalSlots - (runner.freeSlots - 1),
+              slotsUsed: runner.totalSlots - free + 1,
               capacity: runner.totalSlots,
             }
           : { id: null, status: "none", slotsUsed: 0, capacity: 0 },
@@ -165,9 +263,14 @@ export function registerWriteRoutes(
       .returning();
     if (!session) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
     if (session.runnerId) {
+      // Recompute from the live set instead of `+1`: an unconditional increment
+      // could push freeSlots above totalSlots and hand out slots the runner
+      // does not have.
+      const counts = usedSlots(await liveSessionRows(db, cfg));
       const [r] = await db.select().from(runners).where(eq(runners.id, session.runnerId)).limit(1);
-      if (r && r.freeSlots < r.totalSlots) {
-        await db.update(runners).set({ freeSlots: r.freeSlots + 1 }).where(eq(runners.id, r.id));
+      if (r) {
+        const free = Math.max(r.totalSlots - (counts.get(r.id) ?? 0), 0);
+        await db.update(runners).set({ freeSlots: free }).where(eq(runners.id, r.id));
       }
     }
     return { ok: true };
@@ -336,25 +439,17 @@ export function registerWriteRoutes(
       .where(and(eq(runners.healthy, true), lte(runners.lastHeartbeat, cutoff)));
     let released = 0;
     for (const r of stale) {
-      // Reclaim this runner by resetting its free slots after marking it down;
-      // any sessions pinned to it are ended by their owner's /end path.
-      await db.update(runners).set({ healthy: false, freeSlots: r.totalSlots }).where(eq(runners.id, r.id));
+      // A runner that stopped heartbeating is down: no session may stay pinned
+      // to it, and its slots must not be counted as capacity.
+      await db.update(runners).set({ healthy: false }).where(eq(runners.id, r.id));
       released += 1;
     }
-    // A runner that never sent a heartbeat (lastHeartbeat null) can never match
-    // `lte(lastHeartbeat, cutoff)`, so slots leaked by sessions that died before
-    // releasing them were unrecoverable. Reset those too: nothing is pinned to a
-    // heartbeat-less runner that still owns capacity.
-    const never = await db
-      .select()
-      .from(runners)
-      .where(and(eq(runners.healthy, true), isNull(runners.lastHeartbeat)));
-    let reclaimed = 0;
-    for (const r of never) {
-      if (r.freeSlots === r.totalSlots) continue;
-      await db.update(runners).set({ freeSlots: r.totalSlots }).where(eq(runners.id, r.id));
-      reclaimed += 1;
-    }
-    return { released, reclaimed };
+    // Reconcile counters with the real live set (this also reclaims slots held
+    // by sessions that died without calling `/end`).
+    const reconciled = await reclaim();
+    return { released, reclaimed: reconciled.runners, ended: reconciled.ended };
   });
+
+  /** Orphaned-session reclaim, callable at boot and from a timer. */
+  app.post("/runners/reclaim", async () => reclaim());
 }

@@ -56,6 +56,7 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
       streamsPerRunner: 3,
       maxStreams: 9,
       runnerHeartbeatTtlMs: 15000,
+      sessionTtlMs: 60000,
       ssePollMs: 100,
     };
     const { db } = await openPgliteDb();
@@ -81,6 +82,7 @@ describe("media server E2E ingest -> window -> runner dispatch -> control", () =
       sparseTokensPerFrame: 129,
       speakTokensPerWindow: 48,
       runnerHeartbeatTtlMs: 15000,
+      sessionTtlMs: 60000,
       reconnectGraceMs: 300,
       provisionNoClientMs: 5000,
     };

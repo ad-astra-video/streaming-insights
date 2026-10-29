@@ -10,6 +10,12 @@ export interface ServerConfig {
   maxStreams: number;
   /** Runner considered down when no heartbeat within this window (ms). */
   runnerHeartbeatTtlMs: number;
+  /** Live stream session considered dead when it has produced no window
+   *  activity for this long (ms). A session that dies without calling `/end`
+   *  (browser tab closed, media container killed) must not hold a runner slot
+   *  forever — leaked slots made a healthy deploy answer every new ingest with
+   *  503. */
+  sessionTtlMs: number;
   /** Live SSE feed poll interval (ms) — how often the server checks the event table. */
   ssePollMs: number;
   /** Public media origin handed to the browser for WebRTC signaling / WSS
@@ -31,6 +37,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     streamsPerRunner,
     maxStreams,
     runnerHeartbeatTtlMs: parseInt(env.RUNNER_HEARTBEAT_TTL_MS ?? "15000", 10),
+    sessionTtlMs: parseInt(env.SESSION_TTL_MS ?? "120000", 10),
     ssePollMs: parseInt(env.SSE_POLL_MS ?? "1000", 10),
     mediaPublicBaseUrl: env.MEDIA_PUBLIC_BASE_URL || undefined,
     publicBaseUrl: env.PUBLIC_BASE_URL || undefined,

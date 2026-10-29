@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { eq } from "drizzle-orm";
+import { eq, isNull } from "drizzle-orm";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import { openPgliteDb, type Db } from "../src/db";
 import { buildApp } from "../src/app";
@@ -17,6 +17,7 @@ const cfg: ServerConfig = {
   streamsPerRunner: 3,
   maxStreams: 9,
   runnerHeartbeatTtlMs: 15000,
+  sessionTtlMs: 60000,
   ssePollMs: 100,
 };
 
@@ -140,14 +141,69 @@ describe("control server write path (media -> control ingest)", () => {
     expect(p.statusCode).toBe(404);
   });
 
-  it("hard-stops an unpinned reserve when no runner has a free slot", async () => {
+  it("derives capacity from live sessions instead of the leaked free-slots counter", async () => {
+    // Simulate the deployed failure: a persisted counter says the pool is full
+    // while no session actually holds a slot. The old code answered 503 here.
     await db.update(runners).set({ freeSlots: 0 });
+    const res = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.runner.id).toBeTruthy();
+    expect(body.runner.slotsUsed).toBeGreaterThanOrEqual(1);
+    expect(body.runner.slotsUsed).toBeLessThanOrEqual(body.runner.capacity);
+  });
+
+  it("hard-stops an unpinned reserve when every slot is held by a live session", async () => {
+    // Fill the pool with real reservations (never a hand-set counter), then the
+    // next reserve must fail and must not create a capacity-less session.
+    let filled = 0;
+    for (let i = 0; i < 50; i += 1) {
+      const r = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+      if (r.statusCode === 503) break;
+      expect(r.statusCode).toBe(201);
+      filled += 1;
+    }
+    expect(filled).toBeGreaterThan(0);
     const before = (await db.select().from(sessions)).length;
     const res = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
     expect(res.statusCode).toBe(503);
     // No capacity-less session may be created (`runner_id` null leaked slots
     // because /end had nothing to release).
     expect((await db.select().from(sessions)).length).toBe(before);
+  });
+
+  it("reclaims the slot of a session that died without calling /end", async () => {
+    const res = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    // Pool is full from the previous test, so first free a slot.
+    if (res.statusCode === 503) {
+      const [live] = await db
+        .select()
+        .from(sessions)
+        .where(isNull(sessions.endedAt))
+        .limit(1);
+      await app.inject({ method: "POST", url: `/stream-sessions/${live.id}/end` });
+    }
+    const created = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    expect(created.statusCode).toBe(201);
+    const sid = created.json().session.id as string;
+
+    // Backdate it past the session TTL: the browser went away without /end.
+    await db
+      .update(sessions)
+      .set({ startedAt: new Date(Date.now() - cfg.sessionTtlMs - 1000) })
+      .where(eq(sessions.id, sid));
+
+    const reclaim = await app.inject({ method: "POST", url: "/runners/reclaim" });
+    expect(reclaim.statusCode).toBe(200);
+    expect(reclaim.json().ended).toBeGreaterThanOrEqual(1);
+
+    const [after] = await db.select().from(sessions).where(eq(sessions.id, sid));
+    expect(after.status).toBe("ended");
+    expect(after.endedAt).not.toBeNull();
+
+    // The reclaimed slot is usable again.
+    const reuse = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    expect(reuse.statusCode).toBe(201);
   });
 
   it("returns 404 for a pinned reserve on an unknown runner", async () => {
@@ -160,6 +216,11 @@ describe("control server write path (media -> control ingest)", () => {
   });
 
   it("reap reclaims slots leaked on a runner that never sent a heartbeat", async () => {
+    // Clear live sessions so the reconciliation target is unambiguous.
+    const open = await db.select().from(sessions).where(isNull(sessions.endedAt));
+    for (const s of open) {
+      await db.update(sessions).set({ status: "ended", endedAt: new Date() }).where(eq(sessions.id, s.id));
+    }
     const [row] = await db.select().from(runners).limit(1);
     expect(row.lastHeartbeat).toBeNull();
     await db.update(runners).set({ freeSlots: 0 }).where(eq(runners.id, row.id));
@@ -168,5 +229,41 @@ describe("control server write path (media -> control ingest)", () => {
     expect(res.json().reclaimed).toBeGreaterThanOrEqual(1);
     const [after] = await db.select().from(runners).where(eq(runners.id, row.id));
     expect(after.freeSlots).toBe(after.totalSlots);
+  });
+});
+
+describe("boot reclaim (deploy inheriting leaked slot counters)", () => {
+  it("ends orphaned sessions and reconciles runners on ready", async () => {
+    // Reproduces the deployed state: Postgres outlives the container, so the
+    // new control process inherits slots pinned by sessions that never ended.
+    const opened = await openPgliteDb();
+    const bootDb = opened.db;
+    await migrate(bootDb, { migrationsFolder: MIGRATIONS_DIR });
+    const [stale] = await bootDb
+      .insert(runners)
+      .values({ gpu: 0, totalSlots: 3, freeSlots: 0, healthy: true })
+      .returning();
+    await bootDb
+      .insert(sessions)
+      .values({
+        status: "active",
+        runnerId: stale.id,
+        startedAt: new Date(Date.now() - cfg.sessionTtlMs - 60_000),
+      });
+
+    const bootApp = buildApp({ db: bootDb, cfg });
+    await bootApp.ready();
+    try {
+      const [runner] = await bootDb.select().from(runners).where(eq(runners.id, stale.id));
+      expect(runner.freeSlots).toBe(runner.totalSlots);
+      const [session] = await bootDb.select().from(sessions);
+      expect(session.status).toBe("ended");
+      expect(session.endedAt).not.toBeNull();
+      // And the booted stack can actually take a new ingest.
+      const res = await bootApp.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+      expect(res.statusCode).toBe(201);
+    } finally {
+      await bootApp.close();
+    }
   });
 });

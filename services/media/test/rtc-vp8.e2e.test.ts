@@ -55,6 +55,7 @@ describe("media server RTC VP8 decode", () => {
       sparseTokensPerFrame: 129,
       speakTokensPerWindow: 48,
       runnerHeartbeatTtlMs: 15000,
+      sessionTtlMs: 60000,
     };
     media = await new MediaServer({ cfg }).build();
     await media.listen({ port: 0, host: "127.0.0.1" });

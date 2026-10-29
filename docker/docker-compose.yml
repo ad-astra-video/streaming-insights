@@ -57,6 +57,10 @@ services:
       - RUNNERS=${RUNNERS:-3}
       - STREAMS_PER_RUNNER=${STREAMS_PER_RUNNER:-3}
       - MAX_STREAMS=${MAX_STREAMS:-9}
+      # A stream session with no window activity for this long is dead (browser
+      # closed, media restarted without /end) and gives its runner slot back.
+      # Without this the persisted slot counters leak and every new ingest 503s.
+      - SESSION_TTL_MS=${SESSION_TTL_MS:-120000}
       # Public media origin handed to the browser for RTC signaling (ADAAAA-7286
       # class bug: must be the PUBLIC origin, never the docker-internal
       # control/media hostname). Wired here so a recreate keeps it.

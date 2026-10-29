@@ -5,7 +5,7 @@ import { events, sessions, tokenLedger } from "@streaming-insights/db";
 import { ROUTES, streamWindowEventJsonSchema, CONTRACT_VERSION } from "@streaming-insights/shared";
 import type { Db } from "./db.js";
 import type { ServerConfig } from "./config.js";
-import { registerWriteRoutes, seedRunners } from "./write.js";
+import { reclaimRunnerSlots, registerWriteRoutes, seedRunners } from "./write.js";
 
 export interface AppDeps {
   db: Db;
@@ -177,7 +177,27 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   app.addHook("onReady", async () => {
     const seeded = await seedRunners(db, cfg);
     if (seeded > 0) app.log.info(`seeded ${seeded} runner(s) at ${cfg.streamsPerRunner} slots each`);
+    // Slot counters persist in Postgres across container generations, so a
+    // fresh control process inherits counters leaked by sessions whose browser
+    // or media container died without calling `/end`. Reconcile them against
+    // the (empty at boot) live set, otherwise the stack is healthy but every
+    // new ingest answers 503 "No runner capacity available".
+    const reclaimed = await reclaimRunnerSlots(db, cfg);
+    if (reclaimed.ended > 0 || reclaimed.runners > 0) {
+      app.log.info(
+        `reclaimed ${reclaimed.ended} orphaned session(s), reconciled ${reclaimed.runners} runner slot counter(s)`
+      );
+    }
   });
+
+  // Reclaim on a timer too: a session abandoned mid-stream (tab closed, media
+  // killed) releases its slot once its window activity is older than
+  // `sessionTtlMs`, without waiting for a restart.
+  const reclaimTimer = setInterval(() => {
+    reclaimRunnerSlots(db, cfg).catch((err) => app.log.warn({ err }, "session reclaim failed"));
+  }, Math.max(5000, cfg.sessionTtlMs / 2));
+  reclaimTimer.unref?.();
+  app.addHook("onClose", async () => clearInterval(reclaimTimer));
 
   // Media -> control WRITE path (Phase 7): reserve runner slots, persist
   // windows/events/prompts. Shares the same sessions/tokenLedger/events tables
