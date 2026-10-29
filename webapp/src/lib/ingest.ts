@@ -344,11 +344,18 @@ export async function startIngest(opts: StartIngestOptions): Promise<IngestSessi
     transport,
     async setPrompt(next: string | null) {
       if (closed) return;
-      await fetch(`${mediaBaseUrl}/sessions/${sid}/prompt`, {
+      // CONTRACT: services/media `POST /sessions/:sid/prompt` takes `{ text }`
+      // (matching the control write path's `POST /stream-sessions/:id/prompts`).
+      // Sending `{ prompt }` made the media server reply 422 `text is required`,
+      // so the operator prompt never reached the runner dispatch.
+      const res = await fetch(`${mediaBaseUrl}/sessions/${sid}/prompt`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ prompt: next }),
-      }).catch(() => {});
+        body: JSON.stringify({ text: next }),
+      }).catch(() => undefined);
+      if (res && !res.ok) {
+        console.warn(`[ingest] prompt push rejected: ${res.status}`);
+      }
     },
     async close() {
       if (closed) return;

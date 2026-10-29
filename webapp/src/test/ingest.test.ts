@@ -219,7 +219,8 @@ describe("startIngest", () => {
     });
     await session.setPrompt("describe the crowd");
     const promptCall = calls.find((c) => c.url.endsWith("/sessions/sid-1/prompt"));
-    expect(promptCall?.body).toEqual({ prompt: "describe the crowd" });
+    // The media server's route body is `{ text }` (422 `text is required` otherwise).
+    expect(promptCall?.body).toEqual({ text: "describe the crowd" });
     await session.close();
   });
 
