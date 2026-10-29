@@ -1,0 +1,99 @@
+/*
+ * Token layer — the single source of visual values for the streaming-insights
+ * webapp. Every color, spacing, radius, type, and motion value used by
+ * components comes from these CSS custom properties. Components never hardcode
+ * hex/px values; they reference these tokens. (Convention: reuse the company
+ * DESIGN.md semantic-token approach of role, not literal color.)
+ *
+ * Theme: light-first (OKLCH) so the page reads clean on a laptop; a dark theme
+ * can be layered on later by overriding the same :root tokens.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* ---- Color (semantic roles) ---- */
+  --background: #fafafa;
+  --foreground: #17181a;
+  --card: #ffffff;
+  --card-foreground: #17181a;
+  --primary: #1f2937;
+  --primary-foreground: #ffffff;
+  --secondary: #f1f3f5;
+  --secondary-foreground: #343a40;
+  --muted: #f1f3f5;
+  --muted-foreground: #6b7280;
+  --accent: #eef2f6;
+  --accent-foreground: #1f2937;
+  --border: #e2e6ea;
+  --input: #d8dde3;
+  --ring: #7c8aa0;
+  --destructive: #b42318;
+  --destructive-foreground: #ffffff;
+
+  /* Status: gate decision + connection states. */
+  --status-silent: #256d51;
+  --status-silent-soft: #e7f3ec;
+  --status-speak: #7a3fa8;
+  --status-speak-soft: #f0e8f7;
+  --status-live: #1f7a4d;
+  --status-live-soft: #e7f2ec;
+  --status-error: #b42318;
+  --status-error-soft: #fbeae8;
+  --status-idle: #6b7280;
+  --status-idle-soft: #f1f3f5;
+
+  /* Chart / insight series (sequential, low-chroma). */
+  --chart-1: #1f7a4d;
+  --chart-2: #7a3fa8;
+  --chart-3: #3b6ea0;
+  --chart-4: #a86a2e;
+  --chart-5: #5a5a68;
+
+  /* Simulated-feed preview canvas (demo source animation). */
+  --sim-bg: #343a40;
+  --sim-a: #1f7a4d;
+  --sim-b: #3b6ea0;
+
+  /* ---- Spacing (4px base scale) ---- */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 2.5rem;
+
+  /* ---- Radius ladder ---- */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* ---- Typography ---- */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.55;
+
+  /* ---- Motion ---- */
+  --duration-fast: 120ms;
+  --duration-normal: 200ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-normal: 0ms;
+  }
+}

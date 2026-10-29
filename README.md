@@ -50,6 +50,7 @@ packages/
 services/
   server/          # control server (Fastify, port 3100): ledger consumer + summaries
   media/           # media service (Fastify, port 4070): WebRTC ingest (Phase 2)
+webapp/            # React + Vite single-page app (Phase 4): source -> prompt -> event feed
 Dockerfile         # lightweight control/service image
 Dockerfile.runner  # SGLang feat/mage-vl GPU image (pinned .151 config)
 .github/workflows/ci.yml  # pnpm install + typecheck + build + test
@@ -60,6 +61,7 @@ Dockerfile.runner  # SGLang feat/mage-vl GPU image (pinned .151 config)
 ```sh
 pnpm install
 pnpm dev              # control (3100) + media (4070)
+pnpm --filter @streaming-insights/webapp dev   # webapp on :5173 (proxies /api -> :3100)
 pnpm -r typecheck
 pnpm -r build
 pnpm -r test
