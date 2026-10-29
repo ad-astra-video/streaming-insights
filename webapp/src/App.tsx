@@ -4,11 +4,10 @@ import { SourcePicker, type SourceKind } from "./components/SourcePicker";
 import { Preview } from "./components/Preview";
 import { PromptInput } from "./components/PromptInput";
 import { EventFeed } from "./components/EventFeed";
-import { TokenSavingsCard } from "./components/TokenSavingsCard";
+import { TokenSavingsDashboard } from "./components/TokenSavingsDashboard";
 import { StatusBadge, type SessionStatus } from "./components/StatusBadge";
 import { SimFeed, SIM_EMIT_MS } from "./sim/simSource";
 import { openLiveFeed } from "./lib/springboard";
-import { accumulateMetrics } from "./lib/metrics";
 import { startSimCanvas } from "./lib/canvas";
 
 const DEMO_SESSION_ID = "demo-session";
@@ -36,8 +35,6 @@ export function App() {
 
   activePromptRef.current = activePrompt;
   sessionIdRef.current = sessionId;
-
-  const metrics = useMemo(() => accumulateMetrics(events), [events]);
 
   const addEvent = useCallback((e: StreamWindowEvent) => {
     setEvents((prev) => {
@@ -203,7 +200,7 @@ export function App() {
       <div className="results">
         <section className="panel" aria-label="Token savings">
           <h2 className="panel-title">Token savings</h2>
-          <TokenSavingsCard metrics={metrics} />
+          <TokenSavingsDashboard events={events} />
         </section>
         <section className="panel" aria-label="Live event feed">
           <h2 className="panel-title">Live event feed</h2>

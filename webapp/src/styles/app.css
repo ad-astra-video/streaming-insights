@@ -303,6 +303,117 @@ body {
   margin: var(--space-1) 0 0;
 }
 
+/* ---- Token-savings dashboard (Phase 5) ---- */
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.metric-highlight-window {
+  background: var(--card);
+  border: 1px solid var(--border);
+}
+
+.metric-unit {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+.metric-highlight-sub.is-silent {
+  color: var(--status-silent);
+}
+
+.metric-highlight-sub.is-speak {
+  color: var(--status-speak);
+}
+
+.metric-detail {
+  color: var(--muted-foreground);
+}
+
+.dashboard-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.dashboard-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.dashboard-legend {
+  display: inline-flex;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.legend-key {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--muted-foreground);
+}
+
+.legend-key::before {
+  content: "";
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-key.legend-silent::before {
+  background: var(--status-silent);
+}
+
+.legend-key.legend-speak::before {
+  background: var(--status-speak);
+}
+
+.sparkline {
+  width: 100%;
+  height: 64px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  display: block;
+}
+
+.spark-band.silent {
+  fill: var(--status-silent-soft);
+}
+
+.spark-band.speak {
+  fill: var(--status-speak-soft);
+}
+
+.spark-threshold {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.spark-line {
+  stroke: var(--chart-1);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.empty-spark {
+  padding: var(--space-3);
+}
+
+.dashboard-counters {
+  display: flex;
+  flex-direction: column;
+}
+
 /* ---- Event feed ---- */
 .feed {
   display: flex;
