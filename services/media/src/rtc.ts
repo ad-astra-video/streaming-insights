@@ -204,8 +204,11 @@ export class WebRtcIngestSession extends EventEmitter {
   audioPacketsReceived = 0;
   /** Number of remote ICE candidates trickled in by the browser (diagnostics). */
   remoteCandidates = 0;
-  /** Last observed RTCPeerConnection.connectionState (diagnostics). */
+  /** Last observed ICE connection state (diagnostics; "checking" forever means
+   *  no candidate pair ever nominated). */
   iceState = "new";
+  /** Last observed peer connection state (diagnostics). */
+  peerState = "new";
   /** Candidate types in the last answer we returned (diagnostics). */
   answerCandidates: Record<string, number> = {};
   /** How long the bounded ICE gather wait took on the last offer (ms). */
@@ -314,13 +317,28 @@ export class WebRtcIngestSession extends EventEmitter {
     // Surface the peer's lifecycle: a session that never leaves `checking`
     // (no ICE pair, no DTLS) is the signature of an unreachable answer, and it
     // used to be invisible except as `packets=0` at close (ADAAAA-7582).
-    (pc.connectionState as any)?.subscribe?.((state: string) => {
-      if (state !== this.iceState) {
-        this.iceState = state;
-        // eslint-disable-next-line no-console
-        console.log(`[rtc] connectionState=${state} remoteCandidates=${this.remoteCandidates} packets=${this.packetsReceived}`);
-      }
-      if (state === "closed" || state === "failed") this.emit("close");
+    // werift exposes the lifecycle through observables — `pc.connectionState`
+    // is a plain getter, so the old `pc.connectionState.subscribe(...)` was a
+    // no-op and the close/teardown path never fired. Note werift's
+    // `connectionState` also reports a transient `failed` while ICE checks are
+    // still in flight (it can stay failed even while SRTP flows), so `iceState`
+    // comes from the ICE state observable and only `closed` is terminal.
+    const iceStates = (pc as any).iceConnectionStateChange;
+    iceStates?.subscribe?.((state: string) => {
+      if (state === this.iceState) return;
+      this.iceState = state;
+      // eslint-disable-next-line no-console
+      console.log(`[rtc] iceState=${state} remoteCandidates=${this.remoteCandidates} packets=${this.packetsReceived}`);
+    });
+    const connStates = (pc as any).connectionStateChange;
+    connStates?.subscribe?.((state: string) => {
+      if (state === this.peerState) return;
+      this.peerState = state;
+      // eslint-disable-next-line no-console
+      console.log(`[rtc] connectionState=${state} remoteCandidates=${this.remoteCandidates} packets=${this.packetsReceived}`);
+      // Only a real close tears the session down; a transient `failed` must not
+      // kill a live stream (the old code treated it as terminal but never ran).
+      if (state === "closed") this.emit("close");
     });
     await pc.setRemoteDescription(offer as any);
     const answer = await pc.createAnswer();
@@ -612,6 +630,7 @@ export class WebRtcIngestSession extends EventEmitter {
       // "checking" with candidates but no packets means the media path (TURN
       // relay) is blocked (ADAAAA-7582).
       iceState: this.iceState,
+      peerState: this.peerState,
       remoteCandidates: this.remoteCandidates,
       answerCandidates: this.answerCandidates,
       gatherMs: this.gatherMs,

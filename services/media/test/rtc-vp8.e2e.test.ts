@@ -155,6 +155,9 @@ describe("media server RTC VP8 decode", () => {
     expect(session.rtc.framesEmitted).toBeGreaterThan(0);
     expect(session.rtc.packetsReceived).toBeGreaterThan(0);
     expect(session.rtc.codecMime).toMatch(/VP8/i);
+    // ICE diagnostics track the peer lifecycle (a stale "new"/"checking" here
+    // hid the fact that the answer was unreachable).
+    expect(session.rtc.iceState).toBe("connected");
     // ...and those frames closed at least two dispatch windows.
     expect(session.windowsPosted).toBeGreaterThanOrEqual(2);
 
