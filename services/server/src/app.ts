@@ -152,5 +152,42 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     return { events: rows };
   });
 
+  // The media server POSTs each per-window event here after dispatch, so the
+  // springboard data-out feed (gate + tokens + text) is persisted alongside the
+  // token ledger. Mirrors the ledger write path: the stream session must exist.
+  app.post<{
+    Params: { id: string };
+    Body: {
+      seq: number;
+      tStart: number;
+      tEnd: number;
+      gate?: unknown;
+      tokens?: unknown;
+      prompt?: string;
+      event?: unknown;
+    };
+  }>("/stream-sessions/:id/events", async (req, reply) => {
+    const b = req.body ?? {};
+    if (typeof b.seq !== "number" || typeof b.tStart !== "number" || typeof b.tEnd !== "number") {
+      return reply.code(422).send({ error: "seq, tStart and tEnd are required" });
+    }
+    const session = await getStreamSession(db, req.params.id);
+    if (!session) return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
+    const [row] = await db
+      .insert(events)
+      .values({
+        streamSessionId: req.params.id,
+        seq: b.seq,
+        tStart: b.tStart,
+        tEnd: b.tEnd,
+        gate: b.gate ?? null,
+        tokens: b.tokens ?? null,
+        prompt: b.prompt ?? null,
+        event: b.event ?? null,
+      })
+      .returning();
+    return reply.code(201).send(row);
+  });
+
   return app;
 }
