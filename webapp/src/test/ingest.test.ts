@@ -150,6 +150,11 @@ describe("startIngest", () => {
     expect(FakeWebSocket.instances[0].url).toBe(
       "wss://mage-media.example/stream/sid-1"
     );
+    // Frame timestamps must be wall-clock seconds (the media server feeds them
+    // straight into the window tStart/tEnd and the control-plane ledger).
+    await new Promise((r) => setTimeout(r, 10));
+    const sent = FakeWebSocket.instances[0].sent[0];
+    expect(sent.timestamp).toBeGreaterThan(1_000_000_000);
     await session.close();
   });
 

@@ -164,7 +164,10 @@ function startWsIngest(
       JSON.stringify({
         seq: seq++,
         image,
-        timestamp: performance.now() / 1000,
+        // Wall-clock seconds: the media server uses this for the window's
+        // tStart/tEnd and the control-plane event ledger, so page-relative
+        // `performance.now()` produced nonsensical (near-zero) timestamps.
+        timestamp: Date.now() / 1000,
       })
     );
   };
