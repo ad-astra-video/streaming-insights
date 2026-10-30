@@ -38,12 +38,6 @@ export function App() {
   const ingestRef = useRef<IngestSession | null>(null);
   const runtimeConfigRef = useRef<RuntimeConfig | null>(null);
 
-  useEffect(() => {
-    void loadRuntimeConfig().then((cfg) => {
-      runtimeConfigRef.current = cfg;
-    });
-  }, []);
-
   activePromptRef.current = activePrompt;
   sessionIdRef.current = sessionId;
 
@@ -88,6 +82,13 @@ export function App() {
       setSource(kind);
       setStatus("starting");
       setTransport(null);
+
+      // Resolve the media origin from the control-served runtime config BEFORE
+      // provisioning: the async config load used to land after the close/prompt
+      // calls, pointing them at the page (control) origin — the media server
+      // never saw `/sessions/:sid/close`, so Stop looked dead (ADAAAA-7584).
+      const runtimeCfg = await loadRuntimeConfig();
+      runtimeConfigRef.current = runtimeCfg;
 
       if (kind === "sim") {
         simFeedRef.current = new SimFeed({ sessionId: DEMO_SESSION_ID });

@@ -344,6 +344,7 @@ export async function startIngest(opts: StartIngestOptions): Promise<IngestSessi
     transport,
     async setPrompt(next: string | null) {
       if (closed) return;
+      if (!next) return; // the media route requires a non-empty `text`
       // CONTRACT: services/media `POST /sessions/:sid/prompt` takes `{ text }`
       // (matching the control write path's `POST /stream-sessions/:id/prompts`).
       // Sending `{ prompt }` made the media server reply 422 `text is required`,
@@ -355,8 +356,7 @@ export async function startIngest(opts: StartIngestOptions): Promise<IngestSessi
       }).catch(() => undefined);
       if (res && !res.ok) {
         console.warn(`[ingest] prompt push rejected: ${res.status}`);
-      }
-    },
+      }    },
     async close() {
       if (closed) return;
       closed = true;
