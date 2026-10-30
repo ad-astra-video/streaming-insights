@@ -29,6 +29,7 @@ import {
   type EventPayload,
   type LedgerWindowPayload,
 } from "./control-client.js";
+import { buildWindowPayloads } from "./window-payload.js";
 import {
   HttpRunnerClient,
   MockRunnerClient,
@@ -319,47 +320,11 @@ export class MediaServer {
     if (stream.t0 === undefined) stream.t0 = window.tStart;
     const tStart = Math.max(window.tStart - stream.t0, 0);
     const tEnd = Math.max(window.tEnd - stream.t0, tStart);
-    // A silent window generates no response tokens by contract; the runner may
-    // still report a speculative count, so normalize here instead of letting a
-    // silent window show "generated N tokens".
-    const generated = outcome.decision === "silent" ? 0 : outcome.tokensGenerated;
-    // 1) token-ledger row.
-    const ledger: LedgerWindowPayload = {
-      seq: window.seq,
-      tStart,
-      tEnd,
-      pSpeak: outcome.pSpeak,
-      decision: outcome.decision,
-      tokensVisual: outcome.tokensVisual,
-      tokensBaselineDense: outcome.tokensBaselineDense,
-      tokensGenerated: generated,
-      prompt: stream.prompt,
-      responseText: outcome.responseText ?? undefined,
-    };
-    // 2) springboard event (gate + tokens + text).
-    const saved = Math.max(outcome.tokensBaselineDense - outcome.tokensVisual, 0);
-    // CONTRACT: `savedVsBaseline` is a FRACTION (1 - visual/baselineDense), not
-    // the saved token COUNT. Emitting the count made the webapp feed print
-    // "saved 69000%".
-    const savedVsBaseline =
-      outcome.tokensBaselineDense > 0 ? Math.min(saved / outcome.tokensBaselineDense, 1) : 0;
-    const event: EventPayload = {
-      seq: window.seq,
-      tStart,
-      tEnd,
-      gate: { pSpeak: outcome.pSpeak, decision: outcome.decision },
-      tokens: {
-        visual: outcome.tokensVisual,
-        baselineDense: outcome.tokensBaselineDense,
-        generated,
-        savedVsBaseline,
-      },
-      prompt: stream.prompt,
-      event: {
-        type: outcome.decision === "speak" ? "response" : "silent",
-        text: outcome.responseText,
-      },
-    };
+    const { ledger, event } = buildWindowPayloads(
+      outcome,
+      { seq: window.seq, tStart, tEnd },
+      stream.prompt
+    );
     try {
       await this.control.postWindow(stream.sid, ledger);
       stream.windowsPosted++;

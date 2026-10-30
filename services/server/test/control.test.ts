@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
@@ -265,5 +266,57 @@ describe("boot reclaim (deploy inheriting leaked slot counters)", () => {
     } finally {
       await bootApp.close();
     }
+  });
+
+  // Regression: a fractional runner token count used to throw inside the insert
+  // and surface as an opaque 500, silently dropping the window from the ledger.
+  it("rounds fractional token counts instead of failing the ledger write", async () => {
+    const c = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    const sid = c.json().session.id;
+
+    const w = await app.inject({
+      method: "POST",
+      url: `/stream-sessions/${sid}/windows`,
+      payload: {
+        seq: 7,
+        tStart: 12,
+        tEnd: 14,
+        pSpeak: 0.8,
+        decision: "speak",
+        tokensVisual: 262.5,
+        tokensBaselineDense: 1152.4,
+        tokensGenerated: 22.6,
+      },
+    });
+    expect(w.statusCode).toBe(201);
+    expect(w.json().tokensVisual).toBe(263);
+    expect(w.json().tokensBaselineDense).toBe(1152);
+    expect(w.json().tokensGenerated).toBe(23);
+
+    const read = await app.inject({ method: "GET", url: `/stream-sessions/${sid}/windows` });
+    expect(read.json().windows.map((r: { seq: number }) => r.seq)).toContain(7);
+  });
+
+  it("rejects a non-numeric token count with 422 instead of a 500", async () => {
+    const c = await app.inject({ method: "POST", url: "/stream-sessions", payload: { source: "webrtc" } });
+    const sid = c.json().session.id;
+
+    const w = await app.inject({
+      method: "POST",
+      url: `/stream-sessions/${sid}/windows`,
+      payload: { seq: 8, tStart: 0, tEnd: 1, tokensVisual: "many" },
+    });
+    expect(w.statusCode).toBe(422);
+    expect(w.json().error).toBe("token counts must be finite numbers");
+  });
+
+  it("answers 404 for a window posted to an unknown session", async () => {
+    const w = await app.inject({
+      method: "POST",
+      url: `/stream-sessions/${randomUUID()}/windows`,
+      payload: { seq: 0, tStart: 0, tEnd: 1, tokensVisual: 10 },
+    });
+    expect(w.statusCode).toBe(404);
+    expect(w.json().error).toContain("Stream session not found");
   });
 });

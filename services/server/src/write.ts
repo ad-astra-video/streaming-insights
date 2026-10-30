@@ -25,6 +25,21 @@ interface ReservedResult {
 }
 
 /**
+ * Whole-token count for a `token_ledger.tokens_*` column (`integer`).
+ *
+ * A fractional count from an ingest client used to throw inside the insert and
+ * surface as an opaque 500, dropping the window from the ledger while the media
+ * server only logged `postWindow failed ... 500`. Coerce to whole tokens and
+ * reject non-numeric input with a 422 so the failure names its field.
+ * Returns `null` for a value that is present but not a finite number.
+ */
+function intTokenCount(value: unknown): number | null {
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.max(0, Math.round(value));
+}
+
+/**
  * Register the media -> control write routes. Contract (matches
  * services/media/src/control-client.ts ControlClient):
  *   POST /stream-sessions                        { source?, runnerId? } -> session + runner
@@ -326,6 +341,22 @@ export function registerWriteRoutes(
     if (typeof b.seq !== "number" || typeof b.tStart !== "number" || typeof b.tEnd !== "number") {
       return reply.code(422).send({ error: "seq, tStart and tEnd are required" });
     }
+    const tokensVisual = intTokenCount(b.tokensVisual);
+    const tokensBaselineDense = intTokenCount(b.tokensBaselineDense);
+    const tokensGenerated = intTokenCount(b.tokensGenerated);
+    if (tokensVisual === null || tokensBaselineDense === null || tokensGenerated === null) {
+      return reply.code(422).send({ error: "token counts must be finite numbers" });
+    }
+    // Same existence guard as the events route: a reaped/unknown session must
+    // answer 404 (the client can then stop) instead of failing an FK insert.
+    const session = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.id, req.params.id))
+      .limit(1);
+    if (session.length === 0) {
+      return reply.code(404).send({ error: `Stream session not found: ${req.params.id}` });
+    }
     const [row] = await db
       .insert(tokenLedger)
       .values({
@@ -335,9 +366,9 @@ export function registerWriteRoutes(
         tEnd: b.tEnd,
         pSpeak: b.pSpeak ?? 0,
         decision: b.decision ?? "silent",
-        tokensVisual: b.tokensVisual ?? 0,
-        tokensBaselineDense: b.tokensBaselineDense ?? 0,
-        tokensGenerated: b.tokensGenerated ?? 0,
+        tokensVisual,
+        tokensBaselineDense,
+        tokensGenerated,
         prompt: b.prompt ?? null,
         responseText: b.responseText ?? null,
       })

@@ -50,6 +50,25 @@ async function listEventsAfter(db: Db, sessionId: string, afterSeq: number): Pro
 export function buildApp(deps: AppDeps): FastifyInstance {
   const { db, cfg } = deps;
   const app = Fastify({ logger: false });
+  // A failed write previously surfaced as a bare 500 with no server-side trace
+  // (`logger: false`), so a dropped window was undiagnosable from the box and
+  // the media log only said "postWindow failed -> 500". Log the cause with the
+  // route; keep the public body generic so internals are not leaked.
+  app.setErrorHandler((err, req, reply) => {
+    const status =
+      typeof (err as { statusCode?: number }).statusCode === "number"
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+    if (status >= 500) {
+      console.error(
+        `[control] ${req.method} ${req.url} failed:`,
+        err instanceof Error ? (err.stack ?? err.message) : err
+      );
+    }
+    reply
+      .code(status)
+      .send({ error: status >= 500 ? "Internal Server Error" : (err as Error).message });
+  });
   app.register(cors, { origin: true });
 
   // Health — used by runners/ingress and on the deploy health probe.

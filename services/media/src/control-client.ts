@@ -79,7 +79,12 @@ export class ControlClient {
       }
     }
     if (!res.ok) {
-      const msg = parsed?.error ? `: ${parsed.error}` : "";
+      // Surface the control server's own diagnostic text: a 500 body carries the
+      // Fastify `message` (e.g. the Postgres error). Without it the media log
+      // showed only "-> 500: Internal Server Error" and the lost window could
+      // not be explained from the box.
+      const detail = parsed?.message || parsed?.error || text.slice(0, 300);
+      const msg = detail ? `: ${detail}` : "";
       throw new Error(`control ${url} -> ${res.status}${msg}`);
     }
     return parsed;
