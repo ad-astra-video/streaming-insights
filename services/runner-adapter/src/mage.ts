@@ -49,6 +49,12 @@ export interface ParsedOutcomeOptions {
   denseTokensPerFrame: number;
   frameCount: number;
   usage?: ChatUsage;
+  /** True when the window carried a non-empty operator prompt. An operator
+   *  prompt is a DIRECT question the assistant must answer, so a non-empty
+   *  model answer (`text`) is spoken even if the model's self-assigned
+   *  `pSpeak` is below the gate threshold. Proactive (no-prompt) windows keep
+   *  the strict `pSpeak >= gateThreshold && text` gate. */
+  hasPrompt?: boolean;
 }
 
 /** Rough token count for the instruction text, subtracted from the prompt
@@ -66,15 +72,32 @@ function clamp01(v: number): number {
  *  comparison (dense baseline vs actual visual tokens) is reproducible. */
 export function buildInstruction(req: WindowRequest, frames: WindowFrame[]): string {
   const span = Math.max(0, req.tEnd - req.tStart);
+  const operatorPrompt = req.prompt?.trim();
   const lines = [
     "You are the Mage-VL proactive streaming assistant scoring ONE live-stream window.",
     `Window #${req.seq}, covering ${span.toFixed(2)}s with ${frames.length} sampled frame(s), oldest first.`,
   ];
-  if (req.prompt && req.prompt.trim()) lines.push(`Operator prompt: ${req.prompt.trim()}`);
-  lines.push(
-    "Decide whether you should SPEAK right now about what is happening in this window, and if so what to say.",
-    'Reply with JSON only, no prose: {"pSpeak": <number 0..1, confidence you should speak now>, "text": <short spoken line, or null when staying silent>}',
-  );
+  if (operatorPrompt) {
+    // Prompted windows: the operator prompt is a DIRECT question. The order
+    // below was validated against the live Mage-VL runner (ADAAAA-7586): with
+    // the question placed LAST after a few-shot example the model answers in
+    // `text` reliably; with the prompt embedded mid-instruction it returned
+    // `{"pSpeak": 0.0, "text": null}` at temperature 0.
+    lines.push(
+      'Reply with JSON only, no prose: {"pSpeak": <number 0..1, confidence in your answer>, "text": <short spoken line, or null only when staying silent with no operator prompt>}',
+    );
+    lines.push(
+      'Example exchange:\nUser: How many white cars are there?\nAssistant: {"pSpeak": 0.9, "text": "I see two white cars."}',
+    );
+    lines.push(`Now: ${operatorPrompt}`);
+  } else {
+    lines.push(
+      "No operator prompt is set. Decide whether you should proactively SPEAK right now about what is happening in this window, and if so what to say.",
+    );
+    lines.push(
+      'Reply with JSON only, no prose: {"pSpeak": <number 0..1, confidence you should speak now>, "text": <short spoken line, or null when staying silent>}',
+    );
+  }
   return lines.join("\n");
 }
 
@@ -135,7 +158,9 @@ export function parseWindowOutcome(
     const rawText = obj.text;
     if (typeof rawText === "string" && rawText.trim()) text = rawText.trim();
   }
-  const decideSpeak = pSpeak >= opts.gateThreshold && text !== null;
+  const decideSpeak = opts.hasPrompt
+    ? text !== null
+    : pSpeak >= opts.gateThreshold && text !== null;
   const promptTokens = opts.usage?.prompt_tokens ?? 0;
   const completionTokens = opts.usage?.completion_tokens ?? textTokenEstimate(content);
   return {
@@ -209,6 +234,7 @@ export class MageClient {
         denseTokensPerFrame: this.cfg.denseTokensPerFrame,
         frameCount: frames.length,
         usage: json?.usage,
+        hasPrompt: Boolean(req.prompt && req.prompt.trim()),
       },
       textTokenEstimate(instruction),
     );

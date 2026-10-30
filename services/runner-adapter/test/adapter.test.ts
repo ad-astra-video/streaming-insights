@@ -108,9 +108,21 @@ describe("chat payload", () => {
     expect(used.map((f) => f.ts)).toEqual([3, 4]);
   });
 
-  it("carries the operator prompt into the instruction", () => {
+  it("carries the operator prompt into the instruction as a direct question", () => {
     const text = buildInstruction(windowReq({ prompt: "describe the road" }), windowReq().frames);
-    expect(text).toContain("Operator prompt: describe the road");
+    // Prompted layout (live-model-validated): schema, few-shot example, then the
+    // question LAST. The model answers reliably only with this order.
+    expect(text).toContain("Now: describe the road");
+    expect(text).toContain('Example exchange:\nUser: How many white cars are there?\nAssistant: {"pSpeak": 0.9, "text": "I see two white cars."}');
+    expect(text.indexOf("Example exchange")).toBeLessThan(text.indexOf("Now: describe the road"));
+    expect(text).not.toContain("No operator prompt is set");
+  });
+
+  it("uses proactive (no-prompt) wording when no prompt is set", () => {
+    const text = buildInstruction(windowReq(), windowReq().frames);
+    expect(text).toContain("No operator prompt is set");
+    expect(text).not.toContain("Now: ");
+    expect(text).not.toContain("Example exchange");
   });
 });
 
@@ -139,6 +151,27 @@ describe("outcome parsing", () => {
 
   it("stays silent when the model has no line to say, even with high pSpeak", () => {
     const out = parseWindowOutcome('{"pSpeak": 0.95, "text": null}', opts);
+    expect(out.decision).toBe("silent");
+    expect(out.responseText).toBeNull();
+  });
+
+  it("speaks a model answer to an operator prompt even when pSpeak is below the gate", () => {
+    const out = parseWindowOutcome(
+      '{"pSpeak": 0.1, "text": "I can see 4 red players."}',
+      { ...opts, hasPrompt: true },
+    );
+    expect(out.decision).toBe("speak");
+    expect(out.responseText).toBe("I can see 4 red players.");
+  });
+
+  it("stays silent for a prompted window when the model gives no answer text", () => {
+    const out = parseWindowOutcome('{"pSpeak": 0.0, "text": null}', { ...opts, hasPrompt: true });
+    expect(out.decision).toBe("silent");
+    expect(out.responseText).toBeNull();
+  });
+
+  it("keeps the strict gate for proactive (no-prompt) windows", () => {
+    const out = parseWindowOutcome('{"pSpeak": 0.1, "text": "proactive line"}', opts);
     expect(out.decision).toBe("silent");
     expect(out.responseText).toBeNull();
   });
