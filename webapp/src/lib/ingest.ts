@@ -356,7 +356,8 @@ export async function startIngest(opts: StartIngestOptions): Promise<IngestSessi
       }).catch(() => undefined);
       if (res && !res.ok) {
         console.warn(`[ingest] prompt push rejected: ${res.status}`);
-      }    },
+      }
+    },
     async close() {
       if (closed) return;
       closed = true;

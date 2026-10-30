@@ -224,6 +224,20 @@ describe("startIngest", () => {
     await session.close();
   });
 
+  it("does not push empty or null prompts (media route requires non-empty text)", async () => {
+    const { startIngest } = await import("../lib/ingest");
+    const session = await startIngest({
+      stream: mediaStream,
+      mediaBaseUrl: "https://mage-media.example",
+    });
+    await session.setPrompt("");
+    await session.setPrompt(null);
+    expect(
+      calls.filter((c) => c.url.endsWith("/sessions/sid-1/prompt")).length
+    ).toBe(0);
+    await session.close();
+  });
+
   it("releases the session and surfaces an error when both transports fail", async () => {
     FakePc.mode = "stall";
     (globalThis as any).WebSocket = class {
